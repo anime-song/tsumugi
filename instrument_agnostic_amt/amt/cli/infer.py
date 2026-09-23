@@ -547,6 +547,7 @@ def run_inference(
     window_batch_size=1,
     disable_tqdm=False,
     allowed_instrument_ids=None,
+    on_window_consumed=None,
     **_,
 ):
     settings = replace(
@@ -572,6 +573,7 @@ def run_inference(
         settings=settings,
         velocity=velocity,
         forward_model=forward_model,
+        on_window_consumed=on_window_consumed,
     )
     return notes, stats, {}
 
