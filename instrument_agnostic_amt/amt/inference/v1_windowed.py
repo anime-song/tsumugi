@@ -129,6 +129,7 @@ def decode_v1_notes(
     settings: InferenceSettings,
     velocity: int,
     forward_model: Callable[..., dict[str, torch.Tensor | None]] | None = None,
+    on_window_consumed: Callable[[WindowNoteStitcher, int], None] | None = None,
 ) -> tuple[list[PredictedNote], dict[str, int]]:
     if waveform.dim() != 2:
         raise ValueError("waveform must have shape [channels, audio_frames]")
@@ -373,6 +374,8 @@ def decode_v1_notes(
                         # continuation track independent of per-window class jitter.
                         note.instrument_id = 0
                         stitcher.notes_by_pair[track].append(note)
+            if on_window_consumed is not None:
+                on_window_consumed(stitcher, int(window_start))
 
         del (
             outputs,
