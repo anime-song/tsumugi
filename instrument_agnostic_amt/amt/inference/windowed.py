@@ -558,6 +558,7 @@ def decode_notes(
     settings: InferenceSettings,
     velocity: int,
     forward_model: Callable[..., dict[str, torch.Tensor | None]] | None = None,
+    on_window_consumed: Callable[[WindowNoteStitcher, int], None] | None = None,
 ) -> tuple[list[PredictedNote], dict[str, int]]:
     if config.semi_crf_version == "v1":
         from .v1_windowed import decode_v1_notes
@@ -573,6 +574,7 @@ def decode_notes(
             settings=settings,
             velocity=velocity,
             forward_model=forward_model,
+            on_window_consumed=on_window_consumed,
         )
     if waveform.dim() != 2:
         raise ValueError("waveform must have shape [channels, audio_frames]")
@@ -830,6 +832,8 @@ def decode_notes(
                 valid_audio_frames=int(valid_frames),
                 valid_model_frames=sample_valid_length,
             )
+            if on_window_consumed is not None:
+                on_window_consumed(note_stitcher, int(start_frame))
 
         del (
             outputs,
