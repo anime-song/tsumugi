@@ -39,6 +39,7 @@ from ..decoding.legacy_grid import (
     detect_peaks,
 )
 from ..midi_roll import MidiFrameLoader, MidiFrameLoaderConfig
+from ..sheetsage import SheetSageBeatGrid
 from ..tempo_map_export import MeterSegmentSpec, export_tempo_mapped_midi
 from ...runtime import copy_tensors_to_cpu_once, resolve_device
 
@@ -137,6 +138,7 @@ class BeatChordInferenceConfig:
     window_ms_override: int | None = None
     stride_ms_override: int | None = None
     window_batch_size: int = 1
+    # grid / grid_legacy / peaks、または外部の拍格子を使うときの none (ビート復号を省く)。
     beat_decode_mode: str = "grid"
     beat_threshold: float = 0.5
     downbeat_threshold: float = 0.5
@@ -443,8 +445,15 @@ def run_beat_chord_inference(
     )
     meter_logits_numpy = meter_logits_accum.numpy()
 
-    raw_downbeat_frame_indices = detect_peaks(downbeat_probabilities_numpy, threshold=config.downbeat_threshold)
-    downbeat_frame_indices = list(raw_downbeat_frame_indices)
+    # "none" は拍格子を外部 (SheetSage2-Refined) から受け取るときのモードで、
+    # ビート・ダウンビート・拍子の復号をすべて省き、コードとキーだけを返す。
+    beat_frame_indices: list[int] = []
+    if beat_decode_mode == "none":
+        downbeat_frame_indices = []
+    else:
+        downbeat_frame_indices = list(
+            detect_peaks(downbeat_probabilities_numpy, threshold=config.downbeat_threshold)
+        )
 
     meter_segments = []
     decoder_diagnostics = {}
@@ -649,6 +658,7 @@ def predict_beat_chord_for_midi(
     preloaded_metadata: Mapping[str, object] | None = None,
     audio_path: Path | str | None = None,
     audio_refinement: AudioRefinementConfig | None = None,
+    beat_grid: SheetSageBeatGrid | None = None,
 ) -> Path:
     """指定された MIDI 入力に対して beat/chord/key を推論し、テンポマップ書き込み済み MIDI を出力する。
 
@@ -660,6 +670,11 @@ def predict_beat_chord_for_midi(
     PLP) を取り出してビートデコードに使う。beat モデルは MIDI ロールしか
     見ないため、倍テンポ/半テンポとフレーム量子化由来のテンポ揺れは
     この情報がないと原理的に直せない。省略時は従来どおり MIDI のみで動く。
+
+    ``beat_grid`` を渡すと、ビート・拍子はそれ (SheetSage2-Refined の推定) を
+    そのまま使い、このモデルからはコードとキーだけを取る。tsumugi 側のビート
+    復号と音声テンポ解析は走らせないので ``audio_path`` は使われない。
+    セクションがあれば "Predicted Sections" トラックとして書き込む。
     """
     input_midi_file = Path(input_midi_path).resolve()
     if not input_midi_file.exists():
@@ -703,6 +718,9 @@ def predict_beat_chord_for_midi(
         grid_jit = is_jit_grid_available()
     
     # Defaults in original function
+    if beat_grid is not None:
+        beat_decode_mode = "none"
+        audio_path = None
     config = BeatChordInferenceConfig(
         device=device_obj,
         audio_path=None if audio_path is None else Path(audio_path),
@@ -734,13 +752,22 @@ def predict_beat_chord_for_midi(
     )
 
     output_midi_file.parent.mkdir(parents=True, exist_ok=True)
+    if beat_grid is None:
+        beat_times = result.beat_times
+        meter_segments = build_meter_segment_specs(result)
+        section_segments = []
+    else:
+        beat_times = list(beat_grid.beat_times)
+        meter_segments = list(beat_grid.meter_segments)
+        section_segments = list(beat_grid.section_segments)
     export_tempo_mapped_midi(
         source_midi_path=input_midi_file,
         output_midi_path=output_midi_file,
-        beat_times=result.beat_times,
-        meter_segments=build_meter_segment_specs(result),
+        beat_times=beat_times,
+        meter_segments=meter_segments,
         chord_segments=result.chord_segments,
         key_segments=result.key_segments,
+        section_segments=section_segments,
         duration_seconds=result.duration_seconds,
         ticks_per_beat=config.beat_mapped_ticks_per_beat,
     )

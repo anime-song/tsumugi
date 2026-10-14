@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import gc
+import json
 import weakref
 from inspect import signature
 from pathlib import Path
@@ -12,6 +13,7 @@ import pytest
 import soundfile as sf
 import torch
 
+from instrument_agnostic_amt.beat_chord.sheetsage import SheetSageBeatGrid
 from instrument_agnostic_amt.cli import infer_stem
 from instrument_agnostic_amt.cli.infer_stem import (
     get_beat_chord_models,
@@ -827,6 +829,7 @@ def _install_fake_waveform_cache_pipeline(
         refine_instruments: bool = True,
         predict_velocity: bool = True,
         predict_beat_chord: bool = False,
+        beat_source: str = "tsumugi",
     ) -> dict[str, object]:
         nonlocal run_count
         run_count += 1
@@ -836,6 +839,7 @@ def _install_fake_waveform_cache_pipeline(
             refine_instruments=refine_instruments,
             predict_velocity=predict_velocity,
             predict_beat_chord=predict_beat_chord,
+            beat_source=beat_source,
             device="cpu",
         )
 
@@ -1034,3 +1038,82 @@ def test_stem_pipeline_velocity_ignores_a_missing_stem_during_preload(
     pipeline.run(refine_instruments=False)
 
     assert len(pipeline.velocity_waveforms) == 1
+
+
+def test_stem_pipeline_takes_beats_from_sheetsage2_by_default() -> None:
+    parameters = signature(run_stem_separated_transcription).parameters
+
+    assert parameters["beat_source"].default == "sheetsage2"
+
+
+def test_stem_pipeline_rejects_unknown_beat_source(tmp_path: Path) -> None:
+    source_audio = tmp_path / "song.wav"
+    _write_stem_audio(source_audio, frequency=440.0)
+
+    with pytest.raises(ValueError, match="beat_source"):
+        run_stem_separated_transcription(source_audio, beat_source="madmom")
+
+
+def test_stem_pipeline_hands_sheetsage_beat_grid_to_beat_chord(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    pipeline = _install_fake_waveform_cache_pipeline(tmp_path, monkeypatch)
+    sheetsage_model = object()
+    beat_grid = SheetSageBeatGrid(
+        beat_times=(0.0, 0.5),
+        downbeat_times=(0.0,),
+        meter_segments=(),
+        section_segments=({"start": 0.0, "end": 1.0, "label": "intro"},),
+    )
+    sheetsage_calls: list[tuple[object, tuple[int, ...], int]] = []
+
+    def fake_predict(model: object, waveform: np.ndarray, sample_rate: int):
+        sheetsage_calls.append((model, waveform.shape, sample_rate))
+        events = [{"time": 0.0, "values": {"structure": "intro"}}]
+        return beat_grid, events, 1.0
+
+    monkeypatch.setattr(
+        infer_stem, "get_sheetsage_model", lambda **_kwargs: sheetsage_model
+    )
+    monkeypatch.setattr(infer_stem, "predict_sheetsage_beat_grid", fake_predict)
+
+    result = pipeline.run(
+        refine_instruments=False,
+        predict_velocity=False,
+        predict_beat_chord=True,
+        beat_source="sheetsage2",
+    )
+
+    # 元音源をモノラルにして渡し、得た拍の格子を beat/chord にそのまま渡す。
+    assert [call[0] for call in sheetsage_calls] == [sheetsage_model]
+    assert len(sheetsage_calls[0][1]) == 1
+    assert pipeline.beat_chord_calls[0]["beat_grid"] is beat_grid
+    assert result["beat_source"] == "sheetsage2"
+    events_path = Path(result["output_root"]) / "merged" / "song_sheetsage2.json"
+    assert json.loads(events_path.read_text(encoding="utf-8"))["events"] == [
+        {"time": 0.0, "values": {"structure": "intro"}}
+    ]
+
+
+def test_stem_pipeline_falls_back_to_tsumugi_beats_when_sheetsage_fails(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    pipeline = _install_fake_waveform_cache_pipeline(tmp_path, monkeypatch)
+
+    def failing_model(**_kwargs: object) -> object:
+        raise ImportError("SheetSage2-Refined is not installed")
+
+    monkeypatch.setattr(infer_stem, "get_sheetsage_model", failing_model)
+
+    result = pipeline.run(
+        refine_instruments=False,
+        predict_velocity=False,
+        predict_beat_chord=True,
+        beat_source="sheetsage2",
+    )
+
+    assert pipeline.beat_chord_calls[0]["beat_grid"] is None
+    assert result["beat_chord_predicted"] is True
+    assert result["beat_source"] == "tsumugi"

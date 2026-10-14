@@ -519,3 +519,66 @@ def test_export_raises_resolution_to_keep_extreme_meter_timing_below_one_ms(
 
     assert result.ticks_per_beat > 960
     assert result.max_note_drift_seconds < 0.001
+
+
+def test_export_writes_sections_on_their_own_marker_track_after_chords(
+    tmp_path: Path,
+) -> None:
+    source_path = tmp_path / "source.mid"
+    output_path = tmp_path / "sections.mid"
+    _write_source_midi(source_path)
+    original_note_times = _note_event_times(source_path)
+
+    result = export_tempo_mapped_midi(
+        source_midi_path=source_path,
+        output_midi_path=output_path,
+        beat_times=[0.0, 0.5, 1.0, 1.5, 2.0, 2.5, 3.0, 3.5],
+        meter_segments=[MeterSegmentSpec(0.0, 4.0, 4, 4, bar_count=2)],
+        chord_segments=[{"start": 0.0, "end": 4.0, "chord": "C:maj"}],
+        section_segments=[
+            {"start": 0.0, "end": 2.0, "label": "intro"},
+            {"start": 2.0, "end": 5.0, "label": "chorus"},
+        ],
+        duration_seconds=5.0,
+    )
+
+    assert result.section_marker_count == 2
+    assert result.chord_marker_count == 1
+    assert result.max_note_drift_seconds < 0.001
+    midi = mido.MidiFile(str(output_path))
+    track_names = [
+        next(message.name for message in track if message.type == "track_name")
+        for track in midi.tracks
+    ]
+    # セクションはコードの後ろに入り、演奏トラックはその後に元の順で続く。
+    assert track_names == [
+        "Predicted Tempo Map",
+        "Predicted Chords",
+        "Predicted Sections",
+        "Source Conductor",
+        "Piano",
+    ]
+    chord_markers = [m.text for m in midi.tracks[1] if m.type == "marker"]
+    assert chord_markers == ["C:maj"]
+
+    section_markers: list[tuple[float, str]] = []
+    tempo = 500_000
+    seconds = 0.0
+    for message in mido.merge_tracks([midi.tracks[0], midi.tracks[2]]):
+        seconds += mido.tick2second(message.time, midi.ticks_per_beat, tempo)
+        if message.type == "set_tempo":
+            tempo = int(message.tempo)
+        if message.type == "marker":
+            section_markers.append((seconds, message.text))
+    assert [text for _, text in section_markers] == ["intro", "chorus"]
+    assert abs(section_markers[1][0] - 2.0) < 0.001
+
+    output_note_times = _note_event_times(output_path)
+    assert len(output_note_times) == len(original_note_times)
+    assert (
+        max(
+            abs(output - original)
+            for output, original in zip(output_note_times, original_note_times)
+        )
+        < 0.001
+    )

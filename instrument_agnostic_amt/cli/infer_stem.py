@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import copy
+import json
 import shutil
 from collections import defaultdict
 from collections.abc import Callable, Mapping, Sequence
@@ -21,6 +22,10 @@ from instrument_agnostic_amt.beat_chord.cli.infer import (
     ensure_beat_chord_checkpoint,
     load_beat_chord_model,
     predict_beat_chord_for_midi,
+)
+from instrument_agnostic_amt.beat_chord.sheetsage import (
+    load_sheetsage_model,
+    predict_sheetsage_beat_grid,
 )
 from instrument_agnostic_amt.instrument_refinement.cli.infer import (
     ensure_refinement_checkpoint,
@@ -58,6 +63,11 @@ _WaveformLoader = Callable[[Path, int], torch.Tensor]
 #         音色の埋め込みで判断する refinement モデルでは原理的に判別できない。実際に
 #         リード全体がコーラス側へ倒れる例が出たため、AMT の判定をそのまま採用する。
 REFINEMENT_EXCLUDED_STEM_GROUPS = ("drums", "vocals")
+
+# ビート・ダウンビート・拍子の推定元。コードとキーはどちらでも tsumugi の beat/chord モデル。
+# tsumugi:    beat/chord モデル (MIDI ロール + 元音源のテンポ解析)。
+# sheetsage2: SheetSage2-Refined (元音源を直接聴く)。セクションも書き込む。既定。
+BEAT_SOURCES = ("tsumugi", "sheetsage2")
 
 
 def merge_midis_logic(
@@ -441,6 +451,23 @@ def get_beat_chord_models(
     return bundle
 
 
+def get_sheetsage_model(
+    device_preference: torch.device | str | None = None,
+) -> object:
+    """SheetSage2-Refined を読み込み、セッション中は再利用する。
+
+    重み (約 2.9GB) は初回だけ Hugging Face からダウンロードされる。
+    """
+    device = resolve_device(device_preference)
+    cache_key = ("sheetsage2", str(device))
+    if cache_key not in STEM_PIPELINE_CACHE:
+        print(f"Loading SheetSage2-Refined on {device} ...")
+        STEM_PIPELINE_CACHE[cache_key] = (load_sheetsage_model(device),)
+    else:
+        print(f"Reusing cached SheetSage2-Refined on {device} ...")
+    return STEM_PIPELINE_CACHE[cache_key][0]
+
+
 def refine_stem_instrument_midis(
     stem_midis: Mapping[str, Path | str],
     stem_audios: Mapping[str, Path | str],
@@ -581,6 +608,7 @@ def run_stem_separated_transcription(
     predict_beat_chord: bool = False,
     beat_chord_checkpoint_path: Path | str | None = None,
     beat_chord_use_audio: bool = True,
+    beat_source: str = "sheetsage2",
     merge_onset_ms: float = 20.0,
     device: torch.device | str | None = "auto",
     amp: bool = False,
@@ -597,10 +625,18 @@ def run_stem_separated_transcription(
     Beat/Chord だけは FP32 のままにしている。こちらは推論時間の大半が
     Python 側のビート格子 DP で、backbone を速くしても全体はほとんど動かない
     一方、確率がそのまま離散的なメーター判定に入るため。
+
+    beat_source はビート・ダウンビート・拍子の推定元 (BEAT_SOURCES)。
+    既定の "sheetsage2" では元音源から SheetSage2-Refined で推定した拍の格子で
+    テンポマップを作り、セクションも "Predicted Sections" トラックに書き込む。
+    コードとキーはどちらの場合も tsumugi の beat/chord モデルの推定を使う。
+    SheetSage2-Refined の推論に失敗したときは警告を出して tsumugi のビートに戻す。
     """
     audio_file = Path(audio_path)
     if not audio_file.exists():
         raise FileNotFoundError(f"Audio file not found: {audio_file}")
+    if beat_source not in BEAT_SOURCES:
+        raise ValueError(f"beat_source must be one of {BEAT_SOURCES}, got {beat_source!r}")
 
     bundle = get_stem_pipeline_models(
         checkpoint_path=checkpoint_path,
@@ -863,8 +899,54 @@ def run_stem_separated_transcription(
                 waveform_cache.clear()
 
     # 6.5 Beat, Chord, Key 予測を実行し、ビート・コード情報を MIDI に書き込む。
+    used_beat_source: str | None = None
     if predict_beat_chord:
         try:
+            # beat_source="sheetsage2" では、ビート・ダウンビート・拍子・セクションを
+            # 元音源から SheetSage2-Refined で推定する。失敗したら tsumugi のビートで続ける。
+            sheetsage_beat_grid = None
+            if beat_source == "sheetsage2":
+                try:
+                    print("Predicting beats, meters, and sections with SheetSage2-Refined...")
+                    sheetsage_model = get_sheetsage_model(device_preference=device)
+                    source_waveform, source_sample_rate = _load_audio_channels_first(audio_file)
+                    (
+                        sheetsage_beat_grid,
+                        sheetsage_events,
+                        sheetsage_duration,
+                    ) = predict_sheetsage_beat_grid(
+                        sheetsage_model,
+                        source_waveform.mean(axis=0),
+                        source_sample_rate,
+                    )
+                    del source_waveform
+                    # SheetSage2-Refined の CLI と同じ形式で残しておくと、
+                    # python -m sheetsage2_refined.visualize でそのまま確認できる。
+                    sheetsage_json_path = merged_dir / f"{audio_file.stem}_sheetsage2.json"
+                    sheetsage_json_path.write_text(
+                        json.dumps(
+                            {
+                                "audio": str(audio_file),
+                                "duration": sheetsage_duration,
+                                "events": sheetsage_events,
+                            },
+                            ensure_ascii=False,
+                        ),
+                        encoding="utf-8",
+                    )
+                    print(
+                        "SheetSage2-Refined: "
+                        f"beats={len(sheetsage_beat_grid.beat_times)}, "
+                        f"bars={len(sheetsage_beat_grid.meter_segments)}, "
+                        f"sections={len(sheetsage_beat_grid.section_segments)}"
+                    )
+                except Exception as err:
+                    print(
+                        "Warning: SheetSage2-Refined skipped due to error; "
+                        f"falling back to tsumugi beats: {err}"
+                    )
+                    sheetsage_beat_grid = None
+
             print("Predicting beat, chord, key from MIDI...")
             beat_chord_midi_path = merged_dir / f"{audio_file.stem}_beat_chord.mid"
             (
@@ -888,7 +970,9 @@ def run_stem_separated_transcription(
                 # quarter-note pulse from the eighths above it. Handing the
                 # decoder the original mix restores that evidence.
                 audio_path=audio_file if beat_chord_use_audio else None,
+                beat_grid=sheetsage_beat_grid,
             )
+            used_beat_source = "tsumugi" if sheetsage_beat_grid is None else "sheetsage2"
             merged_midi_path = beat_chord_midi_path
             print("Updated merged MIDI with predicted beat/chord/key:", merged_midi_path)
         except Exception as err:
@@ -909,6 +993,8 @@ def run_stem_separated_transcription(
         "instruments_refined": instruments_refined,
         "velocity_predicted": predict_velocity,
         "beat_chord_predicted": predict_beat_chord,
+        # 実際に使ったビートの推定元。SheetSage2-Refined が失敗して戻った場合は "tsumugi"。
+        "beat_source": used_beat_source,
         "semi_crf_backend": bundle["semi_crf_backend"],
     }
     if instruments_refined:

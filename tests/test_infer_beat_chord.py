@@ -122,6 +122,7 @@ def _run_windowed_inference(
     *,
     window_batch_size: int,
     model: _BatchTrackingBeatChordModel | None = None,
+    beat_decode_mode: str = "peaks",
 ) -> tuple[list[int], beat_chord_infer.BeatChordInferenceResult]:
     model_config = MidiFrameModelConfig(
         sample_rate=10,
@@ -139,7 +140,7 @@ def _run_windowed_inference(
         window_ms_override=1_000,
         stride_ms_override=1_000,
         window_batch_size=window_batch_size,
-        beat_decode_mode="peaks",
+        beat_decode_mode=beat_decode_mode,
         beat_threshold=1.1,
         downbeat_threshold=1.1,
     )
@@ -353,6 +354,38 @@ def test_run_beat_chord_batches_windows_without_changing_outputs(
     assert batched.downbeat_times == single.downbeat_times
     assert batched.chord_segments == single.chord_segments
     assert batched.key_segments == single.key_segments
+
+
+def test_run_beat_chord_without_beat_decoding_still_returns_chords_and_keys(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    midi_path = tmp_path / "four_windows.mid"
+    _write_windowed_midi(midi_path, duration_seconds=3.1)
+    monkeypatch.setattr(
+        beat_chord_infer,
+        "SingleMidiFrameLoader",
+        _FixedWindowLoader,
+    )
+    _, peaks = _run_windowed_inference(midi_path, window_batch_size=1)
+
+    def fail_peak_picking(*_args: object, **_kwargs: object) -> list[int]:
+        raise AssertionError("beat decoding must be skipped")
+
+    monkeypatch.setattr(beat_chord_infer, "detect_peaks", fail_peak_picking)
+    _, skipped = _run_windowed_inference(
+        midi_path,
+        window_batch_size=1,
+        beat_decode_mode="none",
+    )
+
+    # ビートは外部の拍格子から入れるので空。コードとキーは通常どおり復号する。
+    assert skipped.beat_times == []
+    assert skipped.downbeat_times == []
+    assert skipped.mapped_downbeat_times == []
+    assert skipped.meter_segments == []
+    assert skipped.chord_segments == peaks.chord_segments
+    assert skipped.key_segments == peaks.key_segments
 
 
 def test_run_beat_chord_flushes_the_final_partial_batch(

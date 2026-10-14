@@ -47,6 +47,7 @@ class TempoMappedMidiExportResult:
     max_event_drift_seconds: float
     max_note_drift_seconds: float
     regions: tuple[dict[str, Any], ...]
+    section_marker_count: int = 0
 
     def to_json(self) -> dict[str, Any]:
         data = asdict(self)
@@ -727,6 +728,7 @@ def _verify_reloaded_note_timing(
     *,
     output_midi_path: Path,
     source_tracks: Sequence[Sequence[_TimedMessage]],
+    header_track_count: int,
 ) -> float:
     reloaded = mido.MidiFile(str(output_midi_path), clip=True)
     converter = _TempoConverter.from_events(
@@ -734,7 +736,9 @@ def _verify_reloaded_note_timing(
         tempo_events=_source_tempo_events(reloaded),
     )
     reloaded_tracks = _timed_source_tracks(reloaded, converter)
-    performance_tracks = reloaded_tracks[2:]
+    # 先頭の header_track_count 本はテンポマップ・コード・セクションのトラックで、
+    # 演奏トラックはその後ろに元 MIDI と同じ順で並ぶ。
+    performance_tracks = reloaded_tracks[header_track_count:]
     if len(performance_tracks) != len(source_tracks):
         raise RuntimeError("tempo-mapped MIDI changed the performance track count")
 
@@ -785,10 +789,16 @@ def export_tempo_mapped_midi(
     chord_segments: Sequence[dict[str, Any]],
     duration_seconds: float,
     key_segments: Sequence[dict[str, Any]] = (),
+    section_segments: Sequence[dict[str, Any]] = (),
     ticks_per_beat: int = 960,
     target_max_drift_seconds: float = TARGET_MAX_DRIFT_SECONDS,
 ) -> TempoMappedMidiExportResult:
-    """Write a tempo-mapped MIDI while preserving every source event's seconds."""
+    """Write a tempo-mapped MIDI while preserving every source event's seconds.
+
+    ``section_segments`` (``{"start": seconds, "label": str}``) adds a
+    "Predicted Sections" track of marker events right after the chord track.
+    Without sections the track layout stays tempo map, chords, performance.
+    """
 
     source_midi_path = Path(source_midi_path)
     output_midi_path = Path(output_midi_path)
@@ -923,6 +933,27 @@ def export_tempo_mapped_midi(
     _append_timed_messages(track=chord_track, events=chord_events)
     output_midi.tracks.append(chord_track)
 
+    # セクション (intro / verse / chorus ...) はコードと別トラックの marker にする。
+    # コード読み取り側はトラック名 "Predicted Chords" で marker を拾うので、
+    # 同じトラックに混ぜるとセクション名がコードとして読まれてしまう。
+    if section_segments:
+        section_track = mido.MidiTrack()
+        section_events: list[tuple[int, int, mido.MetaMessage]] = [
+            (0, 0, mido.MetaMessage("track_name", name="Predicted Sections"))
+        ]
+        for index, segment in enumerate(section_segments):
+            start_seconds = max(0.0, float(segment.get("start", 0.0)))
+            section_events.append(
+                (
+                    output_converter.seconds_to_tick(start_seconds),
+                    index + 1,
+                    mido.MetaMessage("marker", text=str(segment.get("label", ""))),
+                )
+            )
+        _append_timed_messages(track=section_track, events=section_events)
+        output_midi.tracks.append(section_track)
+    header_track_count = len(output_midi.tracks)
+
     max_event_drift = 0.0
     max_note_drift = 0.0
     retimed_event_count = 0
@@ -953,6 +984,7 @@ def export_tempo_mapped_midi(
         max_note_drift = _verify_reloaded_note_timing(
             output_midi_path=temporary_path,
             source_tracks=source_tracks,
+            header_track_count=header_track_count,
         )
         if max_note_drift > float(target_max_drift_seconds) * 1.05:
             raise RuntimeError(
@@ -975,4 +1007,5 @@ def export_tempo_mapped_midi(
         max_event_drift_seconds=float(max_event_drift),
         max_note_drift_seconds=float(max_note_drift),
         regions=tuple(regions),
+        section_marker_count=len(section_segments),
     )

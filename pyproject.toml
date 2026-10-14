@@ -26,6 +26,11 @@ stem = [
     "librosa",
     "stem-splitter",
 ]
+# beat_source="sheetsage2" (ビート・拍子・セクションを SheetSage2-Refined で推定) 用。
+# 重みは CC BY-NC 4.0 (非商用)。
+sheetsage = [
+    "sheetsage2-refined",
+]
 training = [
     "audiomentations",
     "pedalboard",
@@ -47,6 +52,7 @@ package = false
 pythonpath = ["."]
 
 [tool.uv.sources]
+sheetsage2-refined = { git = "https://github.com/anime-song/SheetSage2-Refined" }
 torch = [
     { index = "pytorch-cu130", marker = "sys_platform == 'linux' or sys_platform == 'win32'" },
 ]

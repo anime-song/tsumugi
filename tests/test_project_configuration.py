@@ -66,6 +66,7 @@ def test_project_groups_dependencies_by_workflow() -> None:
     assert configuration["project"]["optional-dependencies"] == {
         "evaluation": ["mir-eval"],
         "stem": ["chord-romanizer", "librosa", "stem-splitter"],
+        "sheetsage": ["sheetsage2-refined"],
         "training": [
             "audiomentations",
             "pedalboard",
@@ -85,6 +86,9 @@ def test_uv_uses_cuda_index_on_supported_desktop_platforms() -> None:
 
     assert configuration["tool"]["uv"]["package"] is False
     assert configuration["tool"]["uv"]["sources"] == {
+        "sheetsage2-refined": {
+            "git": "https://github.com/anime-song/SheetSage2-Refined"
+        },
         "torch": [
             {"index": "pytorch-cu130", "marker": cuda_platform_marker}
         ],
@@ -283,3 +287,19 @@ def test_colab_exposes_accelerator_and_compile_options() -> None:
     assert "compile_model=COMPILE_MODEL" in run_source
     assert "compile_velocity=COMPILE_VELOCITY" in run_source
     assert "compile_mode=COMPILE_MODE" in run_source
+
+
+def test_colab_exposes_beat_source_and_installs_the_locked_sheetsage_commit() -> None:
+    run_source = _get_colab_cell_source("stem-sep-run")
+    sheetsage_package = next(
+        package
+        for package in _load_lock()["package"]
+        if package["name"] == "sheetsage2-refined"
+    )
+    locked_commit = sheetsage_package["source"]["git"].rsplit("#", 1)[1]
+
+    assert 'BEAT_SOURCE = "sheetsage2"  # @param ["sheetsage2", "tsumugi"]' in run_source
+    assert "beat_source=BEAT_SOURCE" in run_source
+    # Colab は uv.lock の pylock を --require-hashes で入れるが、git 依存には hash が
+    # 無いので、SheetSage2-Refined は使うときだけ lock と同じ commit を入れる。
+    assert f"@{locked_commit}" in run_source
