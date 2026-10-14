@@ -519,6 +519,22 @@ def get_sheetsage_model(
     return STEM_PIPELINE_CACHE[cache_key][0]
 
 
+def _move_sheetsage_model(model: object, target: torch.device | str) -> None:
+    """SheetSage2-Refined の本体と rescoring 用の frame head をまとめて target へ移す。
+
+    SheetSage2-Refined は nn.Module ではなく、本体 (model.model) と frame head
+    (model.rescoring の各 head) を別々に持つ。さらに本体は推論エンジン
+    (KV キャッシュ・bf16 の重みのコピー・CUDA graph) を _batch_decoder に
+    抱えたままなので、CPU へ戻すときはそれも捨てないと GPU から消えない。
+    エンジンは次の推論で作り直される。
+    """
+    if torch.device(target).type == "cpu":
+        model.model._batch_decoder = None
+    _move_model(model.model, target)
+    for head, _weight in model.rescoring.values():
+        _move_model(head, target)
+
+
 def refine_stem_instrument_midis(
     stem_midis: Mapping[str, Path | str],
     stem_audios: Mapping[str, Path | str],
@@ -1009,9 +1025,16 @@ def run_stem_separated_transcription(
             # 元音源から SheetSage2-Refined で推定する。失敗したら tsumugi のビートで続ける。
             sheetsage_beat_grid = None
             if beat_source == "sheetsage2":
+                sheetsage_model = None
                 try:
                     print("Predicting beats, meters, and sections with SheetSage2-Refined...")
-                    sheetsage_model = get_sheetsage_model(device_preference=device)
+                    if low_vram_mode:
+                        print("[LowVRAM] Loading SheetSage2-Refined on CPU ...")
+                        sheetsage_model = get_sheetsage_model(device_preference="cpu")
+                        print(f"[LowVRAM] Moving SheetSage2-Refined to {device} ...")
+                        _move_sheetsage_model(sheetsage_model, device)
+                    else:
+                        sheetsage_model = get_sheetsage_model(device_preference=device)
                     source_waveform, source_sample_rate = _load_audio_channels_first(audio_file)
                     (
                         sheetsage_beat_grid,
@@ -1049,6 +1072,10 @@ def run_stem_separated_transcription(
                         f"falling back to tsumugi beats: {err}"
                     )
                     sheetsage_beat_grid = None
+                finally:
+                    if low_vram_mode and sheetsage_model is not None:
+                        print("[LowVRAM] Moving SheetSage2-Refined back to CPU ...")
+                        _move_sheetsage_model(sheetsage_model, "cpu")
 
             print("Predicting beat, chord, key from MIDI...")
             beat_chord_midi_path = merged_dir / f"{audio_file.stem}_beat_chord.mid"

@@ -1117,3 +1117,15 @@ def test_stem_pipeline_falls_back_to_tsumugi_beats_when_sheetsage_fails(
     assert pipeline.beat_chord_calls[0]["beat_grid"] is None
     assert result["beat_chord_predicted"] is True
     assert result["beat_source"] == "tsumugi"
+
+
+def test_moving_sheetsage_to_cpu_drops_its_decoding_engine() -> None:
+    body = torch.nn.Linear(2, 2)
+    body._batch_decoder = object()  # KV キャッシュなどを抱えた推論エンジンの代わり
+    head = torch.nn.Linear(2, 2)
+    model = SimpleNamespace(model=body, rescoring={"downbeat": (head, 1.0), "meter": (head, 1.0)})
+
+    infer_stem._move_sheetsage_model(model, "cpu")
+
+    assert body._batch_decoder is None
+    assert next(head.parameters()).device.type == "cpu"
