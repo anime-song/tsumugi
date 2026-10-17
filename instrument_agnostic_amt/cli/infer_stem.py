@@ -66,7 +66,7 @@ REFINEMENT_EXCLUDED_STEM_GROUPS = ("drums", "vocals")
 
 # ビート・ダウンビート・拍子の推定元。コードとキーはどちらでも tsumugi の beat/chord モデル。
 # tsumugi:    beat/chord モデル (MIDI ロール + 元音源のテンポ解析)。
-# sheetsage2: SheetSage2-Refined (元音源を直接聴く)。セクションも書き込む。既定。
+# sheetsage2: SheetSage2-Refined のデコーダーなしビートトラッカー (元音源を直接聴く)。既定。
 BEAT_SOURCES = ("tsumugi", "sheetsage2")
 
 
@@ -505,9 +505,10 @@ def get_beat_chord_models(
 def get_sheetsage_model(
     device_preference: torch.device | str | None = None,
 ) -> object:
-    """SheetSage2-Refined を読み込み、セッション中は再利用する。
+    """SheetSage2-Refined のビートトラッカーを読み込み、セッション中は再利用する。
 
-    重み (約 2.9GB) は初回だけ Hugging Face からダウンロードされる。
+    重み (SheetSage2 の約 2.7GB と 8MB の bar head) は初回だけ Hugging Face から
+    ダウンロードされる。
     """
     device = resolve_device(device_preference)
     cache_key = ("sheetsage2", str(device))
@@ -520,19 +521,15 @@ def get_sheetsage_model(
 
 
 def _move_sheetsage_model(model: object, target: torch.device | str) -> None:
-    """SheetSage2-Refined の本体と rescoring 用の frame head をまとめて target へ移す。
+    """SheetSage2-Refined のビートトラッカーのエンコーダーと bar head をまとめて target へ移す。
 
-    SheetSage2-Refined は nn.Module ではなく、本体 (model.model) と frame head
-    (model.rescoring の各 head) を別々に持つ。さらに本体は推論エンジン
-    (KV キャッシュ・bf16 の重みのコピー・CUDA graph) を _batch_decoder に
-    抱えたままなので、CPU へ戻すときはそれも捨てないと GPU から消えない。
-    エンジンは次の推論で作り直される。
+    ビートトラッカー (HeadBeats) は nn.Module ではなく、エンコーダー (model.encoder) と
+    bar head (model.head) を別々に持つ。入力を送る先と autocast の有無は
+    model.device で決まるので、それも target に合わせる。
     """
-    if torch.device(target).type == "cpu":
-        model.model._batch_decoder = None
-    _move_model(model.model, target)
-    for head, _weight in model.rescoring.values():
-        _move_model(head, target)
+    _move_model(model.encoder, target)
+    _move_model(model.head, target)
+    model.device = torch.device(target)
 
 
 def refine_stem_instrument_midis(
@@ -709,8 +706,8 @@ def run_stem_separated_transcription(
     一方、確率がそのまま離散的なメーター判定に入るため。
 
     beat_source はビート・ダウンビート・拍子の推定元 (BEAT_SOURCES)。
-    既定の "sheetsage2" では元音源から SheetSage2-Refined で推定した拍の格子で
-    テンポマップを作り、セクションも "Predicted Sections" トラックに書き込む。
+    既定の "sheetsage2" では元音源から SheetSage2-Refined のビートトラッカーで
+    推定した拍の格子でテンポマップを作る。
     コードとキーはどちらの場合も tsumugi の beat/chord モデルの推定を使う。
     SheetSage2-Refined の推論に失敗したときは警告を出して tsumugi のビートに戻す。
     """
@@ -1021,13 +1018,13 @@ def run_stem_separated_transcription(
     used_beat_source: str | None = None
     if predict_beat_chord:
         try:
-            # beat_source="sheetsage2" では、ビート・ダウンビート・拍子・セクションを
-            # 元音源から SheetSage2-Refined で推定する。失敗したら tsumugi のビートで続ける。
+            # beat_source="sheetsage2" では、ビート・ダウンビート・拍子を元音源から
+            # SheetSage2-Refined のビートトラッカーで推定する。失敗したら tsumugi のビートで続ける。
             sheetsage_beat_grid = None
             if beat_source == "sheetsage2":
                 sheetsage_model = None
                 try:
-                    print("Predicting beats, meters, and sections with SheetSage2-Refined...")
+                    print("Predicting beats and meters with SheetSage2-Refined...")
                     if low_vram_mode:
                         print("[LowVRAM] Loading SheetSage2-Refined on CPU ...")
                         sheetsage_model = get_sheetsage_model(device_preference="cpu")
@@ -1036,26 +1033,18 @@ def run_stem_separated_transcription(
                     else:
                         sheetsage_model = get_sheetsage_model(device_preference=device)
                     source_waveform, source_sample_rate = _load_audio_channels_first(audio_file)
-                    (
-                        sheetsage_beat_grid,
-                        sheetsage_events,
-                        sheetsage_duration,
-                    ) = predict_sheetsage_beat_grid(
+                    sheetsage_beat_grid, sheetsage_beats = predict_sheetsage_beat_grid(
                         sheetsage_model,
                         source_waveform.mean(axis=0),
                         source_sample_rate,
                     )
                     del source_waveform
-                    # SheetSage2-Refined の CLI と同じ形式で残しておくと、
-                    # python -m sheetsage2_refined.visualize でそのまま確認できる。
-                    sheetsage_json_path = merged_dir / f"{audio_file.stem}_sheetsage2.json"
+                    # python -m sheetsage2_refined.beats が書く JSON と同じ形式で残し、
+                    # トラッカーの生の小節・拍子を後から確認できるようにする。
+                    sheetsage_json_path = merged_dir / f"{audio_file.stem}_sheetsage2.beats.json"
                     sheetsage_json_path.write_text(
                         json.dumps(
-                            {
-                                "audio": str(audio_file),
-                                "duration": sheetsage_duration,
-                                "events": sheetsage_events,
-                            },
+                            {"audio": str(audio_file)} | sheetsage_beats,
                             ensure_ascii=False,
                         ),
                         encoding="utf-8",
@@ -1063,8 +1052,7 @@ def run_stem_separated_transcription(
                     print(
                         "SheetSage2-Refined: "
                         f"beats={len(sheetsage_beat_grid.beat_times)}, "
-                        f"bars={len(sheetsage_beat_grid.meter_segments)}, "
-                        f"sections={len(sheetsage_beat_grid.section_segments)}"
+                        f"bars={len(sheetsage_beat_grid.meter_segments)}"
                     )
                 except Exception as err:
                     print(

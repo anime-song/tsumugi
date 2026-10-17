@@ -2506,10 +2506,11 @@ wheels = [
 
 [[package]]
 name = "sheetsage2-refined"
-version = "0.1.0"
-source = { git = "https://github.com/anime-song/SheetSage2-Refined#1bfc494c3eda2eb80ac43fb82e8f1b8d03aa9a97" }
+version = "0.2.0"
+source = { git = "https://github.com/anime-song/SheetSage2-Refined#0aa7dff16177ec9d694fce4c998e5fce61accbc2" }
 dependencies = [
     { name = "huggingface-hub", extra = ["hf-xet"] },
+    { name = "numba" },
     { name = "numpy", version = "2.2.6", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.11'" },
     { name = "numpy", version = "2.4.6", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version == '3.11.*'" },
     { name = "numpy", version = "2.5.2", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.12'" },
