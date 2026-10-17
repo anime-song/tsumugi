@@ -1064,14 +1064,12 @@ def test_stem_pipeline_hands_sheetsage_beat_grid_to_beat_chord(
         beat_times=(0.0, 0.5),
         downbeat_times=(0.0,),
         meter_segments=(),
-        section_segments=({"start": 0.0, "end": 1.0, "label": "intro"},),
     )
     sheetsage_calls: list[tuple[object, tuple[int, ...], int]] = []
 
     def fake_predict(model: object, waveform: np.ndarray, sample_rate: int):
         sheetsage_calls.append((model, waveform.shape, sample_rate))
-        events = [{"time": 0.0, "values": {"structure": "intro"}}]
-        return beat_grid, events, 1.0
+        return beat_grid, {"duration": 1.0, "beats": [0.0, 0.5], "downbeats": [0.0]}
 
     monkeypatch.setattr(
         infer_stem, "get_sheetsage_model", lambda **_kwargs: sheetsage_model
@@ -1090,10 +1088,10 @@ def test_stem_pipeline_hands_sheetsage_beat_grid_to_beat_chord(
     assert len(sheetsage_calls[0][1]) == 1
     assert pipeline.beat_chord_calls[0]["beat_grid"] is beat_grid
     assert result["beat_source"] == "sheetsage2"
-    events_path = Path(result["output_root"]) / "merged" / "song_sheetsage2.json"
-    assert json.loads(events_path.read_text(encoding="utf-8"))["events"] == [
-        {"time": 0.0, "values": {"structure": "intro"}}
-    ]
+    beats_path = Path(result["output_root"]) / "merged" / "song_sheetsage2.beats.json"
+    saved = json.loads(beats_path.read_text(encoding="utf-8"))
+    assert saved["beats"] == [0.0, 0.5]
+    assert saved["audio"].endswith("song.wav")
 
 
 def test_stem_pipeline_falls_back_to_tsumugi_beats_when_sheetsage_fails(
@@ -1119,13 +1117,14 @@ def test_stem_pipeline_falls_back_to_tsumugi_beats_when_sheetsage_fails(
     assert result["beat_source"] == "tsumugi"
 
 
-def test_moving_sheetsage_to_cpu_drops_its_decoding_engine() -> None:
-    body = torch.nn.Linear(2, 2)
-    body._batch_decoder = object()  # KV キャッシュなどを抱えた推論エンジンの代わり
+def test_moving_sheetsage_moves_its_encoder_head_and_input_device() -> None:
+    encoder = torch.nn.Linear(2, 2)
     head = torch.nn.Linear(2, 2)
-    model = SimpleNamespace(model=body, rescoring={"downbeat": (head, 1.0), "meter": (head, 1.0)})
+    model = SimpleNamespace(encoder=encoder, head=head, device=torch.device("cuda"))
 
     infer_stem._move_sheetsage_model(model, "cpu")
 
-    assert body._batch_decoder is None
+    assert next(encoder.parameters()).device.type == "cpu"
     assert next(head.parameters()).device.type == "cpu"
+    # 入力波形もこの device へ送られるので、重みと一緒に動かす。
+    assert model.device == torch.device("cpu")

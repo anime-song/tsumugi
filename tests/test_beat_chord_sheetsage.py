@@ -3,31 +3,33 @@ from __future__ import annotations
 from pathlib import Path
 from types import SimpleNamespace
 
+import numpy as np
 import pytest
 import torch
 
 from instrument_agnostic_amt.beat_chord.cli import infer as beat_chord_infer
 from instrument_agnostic_amt.beat_chord.sheetsage import (
     SheetSageBeatGrid,
-    sheetsage_events_to_beat_grid,
+    predict_sheetsage_beat_grid,
+    sheetsage_beats_to_beat_grid,
 )
 from instrument_agnostic_amt.beat_chord.tempo_map_export import MeterSegmentSpec
 
 
-def _beat(
-    time: float,
-    position: int,
-    meter: tuple[int, int] | None = None,
-    structure: str | None = None,
+def _result(
+    beats: list[float],
+    bars: list[tuple[float, int, int]],
 ) -> dict[str, object]:
-    """SheetSage2-Refined の 1 拍分のイベント。meter は JSON 経由と同じくリストで持つ。"""
-    rhythm: dict[str, object] = {"eighth_position": position}
-    if meter is not None:
-        rhythm["meter"] = list(meter)
-    values: dict[str, object] = {"timestamp": time, "rhythm": rhythm}
-    if structure is not None:
-        values["structure"] = structure
-    return {"time": time, "values": values}
+    """ビートトラッカーの出力。bars は (開始, 拍の数, 分母)。"""
+    return {
+        "beats": beats,
+        "downbeats": [start for start, _count, _unit in bars],
+        "bars": [
+            {"start": start, "beats": count, "unit": unit, "meter": f"{count}/{unit}"}
+            for start, count, unit in bars
+        ],
+        "meters": sorted({count for _start, count, _unit in bars}),
+    }
 
 
 def _bars(grid: SheetSageBeatGrid) -> list[tuple[float, float, int, int]]:
@@ -37,136 +39,79 @@ def _bars(grid: SheetSageBeatGrid) -> list[tuple[float, float, int, int]]:
     ]
 
 
-def test_short_first_bar_and_later_meter_change_become_their_own_meters() -> None:
-    # 曲頭の 2 拍だけの小節 (実曲で出たもの)、4/4 の小節、3/4 への変更。
-    events = [
-        _beat(0.0, 0, meter=(4, 4), structure="intro"),
-        _beat(0.5, 2),
-        _beat(1.0, 0),
-        _beat(1.5, 2),
-        _beat(2.0, 4),
-        _beat(2.5, 6),
-        _beat(3.0, 0, meter=(3, 4), structure="verse"),
-        _beat(3.5, 2),
-        _beat(4.0, 4),
-        _beat(4.5, 0),
-        _beat(5.0, 2),
-        _beat(5.5, 4),
-    ]
+def test_bars_take_the_trackers_beat_count_and_unit_with_a_pickup_bar() -> None:
+    # 弱起 2 拍、4/4 が 2 小節、拍が倍速になった 7/8、4/4 に戻る。
+    beats = [0.0, 0.5]
+    beats += [1.0 + 0.5 * index for index in range(8)]
+    beats += [5.0 + 0.25 * index for index in range(7)]
+    beats += [6.75 + 0.5 * index for index in range(4)]
+    result = _result(beats, [(1.0, 4, 4), (3.0, 4, 4), (5.0, 7, 8), (6.75, 4, 4)])
 
-    grid = sheetsage_events_to_beat_grid(events, duration=8.0)
+    grid = sheetsage_beats_to_beat_grid(result, duration=10.0)
 
-    assert grid.beat_times == tuple(0.5 * index for index in range(12))
-    assert grid.downbeat_times == (0.0, 1.0, 3.0, 4.5)
-    # 最後の小節は拍子どおり 3 拍揃っているので、最後の拍 + 1 拍分で閉じる。
+    assert grid.beat_times == tuple(beats)
+    assert grid.downbeat_times == (1.0, 3.0, 5.0, 6.75)
+    # 弱起は最初の小節と同じ分母で 2/4。最後の小節は曲中の 4/4 と同じ 4 拍あるので、
+    # 直前の 7/8 と拍の数が違っても、最後の拍 + 1 拍分で閉じて残す。
     assert _bars(grid) == [
         (0.0, 1.0, 2, 4),
         (1.0, 3.0, 4, 4),
-        (3.0, 4.5, 3, 4),
-        (4.5, 6.0, 3, 4),
+        (3.0, 5.0, 4, 4),
+        (5.0, 6.75, 7, 8),
+        (6.75, 8.75, 4, 4),
     ]
 
 
-def test_bar_shorter_than_its_meter_token_is_reexpressed_in_its_beat_unit() -> None:
-    events = [
-        _beat(0.0, 0, meter=(4, 4)),
-        _beat(0.5, 2),
-        _beat(1.0, 4),
-        _beat(1.5, 0),
-        _beat(2.0, 2),
-    ]
+def test_last_bar_cut_short_by_the_end_of_the_song_is_dropped() -> None:
+    # 曲が最後の小節の 2 拍目で終わっている。2/4 の小節として残すと拍子が嘘になる。
+    beats = [0.5 * index for index in range(10)]
+    result = _result(beats, [(0.0, 4, 4), (2.0, 4, 4), (4.0, 2, 4)])
 
-    grid = sheetsage_events_to_beat_grid(events, duration=4.0)
+    grid = sheetsage_beats_to_beat_grid(result, duration=5.0)
 
-    # 4/4 のトークンのまま 3 拍で次のダウンビートが来た小節は 3/4。
-    # 最後の 2 拍は拍子どおりに揃っていないので小節にしない。
-    assert _bars(grid) == [(0.0, 1.5, 3, 4)]
+    assert _bars(grid) == [(0.0, 2.0, 4, 4), (2.0, 4.0, 4, 4)]
 
 
-def test_compound_meter_keeps_its_token_even_with_dotted_quarter_beats() -> None:
-    # 6/8 を付点 4 分で刻むと 1 小節 2 拍 (位置 0, 3)。長さは 8 分音符 6 つでトークンと合う。
-    events = [
-        _beat(0.0, 0, meter=(6, 8)),
-        _beat(0.6, 3),
-        _beat(1.2, 0),
-        _beat(1.8, 3),
-        _beat(2.4, 0),
-    ]
+def test_last_bar_running_past_the_end_of_the_song_is_dropped() -> None:
+    beats = [0.5 * index for index in range(8)]
+    result = _result(beats, [(0.0, 4, 4), (2.0, 4, 4)])
 
-    grid = sheetsage_events_to_beat_grid(events, duration=3.0)
+    grid = sheetsage_beats_to_beat_grid(result, duration=3.8)
 
-    assert _bars(grid)[:2] == [(0.0, 1.2, 6, 8), (1.2, 2.4, 6, 8)]
+    assert _bars(grid) == [(0.0, 2.0, 4, 4)]
 
 
-def test_meter_token_wins_when_the_beat_count_matches_its_numerator() -> None:
-    # 6/8 を 8 分音符で 6 拍刻む小節は、拍の数が分子と一致するのでトークンどおり。
-    # 同じ長さの 3/4 とは拍の数とトークンで区別される。
-    events = [_beat(0.2 * index, index % 6, meter=(6, 8) if index == 0 else None) for index in range(12)]
-    events.append(_beat(2.4, 0, meter=(3, 4)))
-    events += [_beat(2.4 + 0.4 * index, 2 * index) for index in range(1, 3)]
+def test_song_without_downbeats_has_beats_but_no_bars() -> None:
+    result = _result([0.0, 0.5, 1.0], [])
 
-    grid = sheetsage_events_to_beat_grid(events, duration=4.0)
+    grid = sheetsage_beats_to_beat_grid(result, duration=2.0)
 
-    assert [bar[2:] for bar in _bars(grid)] == [(6, 8), (6, 8), (3, 4)]
+    assert grid.beat_times == (0.0, 0.5, 1.0)
+    assert grid.meter_segments == ()
 
 
-@pytest.mark.parametrize(
-    ("beat_seconds", "expected_meter"),
-    [(0.25, (7, 8)), (0.5, (7, 4))],
-)
-def test_bar_that_breaks_its_meter_token_takes_its_unit_from_neighboring_bars(
-    beat_seconds: float,
-    expected_meter: tuple[int, int],
-) -> None:
-    # トークンは 4/4 のまま、実際は 7 拍の小節。位置もトークンにつられて
-    # 4 分音符刻み (0, 2, ..., 12) で付いているので、位置からは常に 7/4 に見える。
-    # 前後の 4/4 の 4 分音符 (0.5 秒) と比べた 1 拍の長さで分母を決める。
-    events = [_beat(0.5 * index, 2 * index, meter=(4, 4) if index == 0 else None) for index in range(4)]
-    odd_start = 2.0
-    events += [_beat(odd_start + beat_seconds * index, 2 * index) for index in range(7)]
-    after_start = odd_start + beat_seconds * 7
-    events += [_beat(after_start + 0.5 * index, 2 * index) for index in range(4)]
-    events.append(_beat(after_start + 2.0, 0))
+def test_predict_resamples_to_the_encoder_rate_and_runs_the_tracker_on_the_waveform() -> None:
+    calls: dict[str, object] = {}
 
-    grid = sheetsage_events_to_beat_grid(events, duration=after_start + 4.0)
+    class FakeTracker:
+        encoder = SimpleNamespace(config=SimpleNamespace(sample_rate=100))
 
-    assert [bar[2:] for bar in _bars(grid)] == [(4, 4), expected_meter, (4, 4)]
+        def probabilities(self, wave: torch.Tensor) -> dict[str, object]:
+            calls["wave_length"] = len(wave)
+            return {"beat": "probabilities"}
 
+        def track_probabilities(self, probs: dict[str, object]) -> dict[str, object]:
+            calls["probs"] = probs
+            return _result([0.0, 0.5, 1.0, 1.5], [(0.0, 4, 4)])
 
-def test_pickup_beats_before_the_first_downbeat_form_a_partial_bar() -> None:
-    events = [
-        _beat(0.0, 4, meter=(4, 4)),
-        _beat(0.5, 6),
-        _beat(1.0, 0),
-        _beat(1.5, 2),
-        _beat(2.0, 4),
-        _beat(2.5, 6),
-        _beat(3.0, 0),
-    ]
+    grid, result = predict_sheetsage_beat_grid(FakeTracker(), np.zeros(400), sample_rate=200)
 
-    grid = sheetsage_events_to_beat_grid(events, duration=3.2)
-
-    # 弱起 (4/4 の 3 拍目から) は 2/4 の小節。ダウンビート 1 拍だけの最後の小節は
-    # 長さが分からないので残さない。
-    assert _bars(grid) == [(0.0, 1.0, 2, 4), (1.0, 3.0, 4, 4)]
-
-
-def test_sections_keep_repeated_labels_as_phrase_boundaries() -> None:
-    events = [
-        _beat(0.0, 0, meter=(4, 4), structure="intro"),
-        _beat(2.0, 0, structure="verse"),
-        _beat(4.0, 0, structure="verse"),
-        {"time": 6.0, "values": {"timestamp": 6.0, "structure": "chorus"}},
-    ]
-
-    grid = sheetsage_events_to_beat_grid(events, duration=10.0)
-
-    assert grid.section_segments == (
-        {"start": 0.0, "end": 2.0, "label": "intro"},
-        {"start": 2.0, "end": 4.0, "label": "verse"},
-        {"start": 4.0, "end": 6.0, "label": "verse"},
-        {"start": 6.0, "end": 10.0, "label": "chorus"},
-    )
+    # 2 秒の波形を 100 Hz に落としてからエンコーダーに渡す。
+    assert calls["wave_length"] == 200
+    assert calls["probs"] == {"beat": "probabilities"}
+    assert result["duration"] == 2.0
+    assert result["bars"][0]["meter"] == "4/4"
+    assert _bars(grid) == [(0.0, 2.0, 4, 4)]
 
 
 def test_predict_beat_chord_uses_the_given_beat_grid_and_skips_beat_decoding(
@@ -179,7 +124,6 @@ def test_predict_beat_chord_uses_the_given_beat_grid_and_skips_beat_decoding(
         beat_times=(0.0, 0.5, 1.0, 1.5),
         downbeat_times=(0.0,),
         meter_segments=(MeterSegmentSpec(0.0, 2.0, 4, 4),),
-        section_segments=({"start": 0.0, "end": 2.0, "label": "intro"},),
     )
     captured: dict[str, object] = {}
     chord_segments = [{"start": 0.0, "end": 2.0, "chord": "C:maj"}]
@@ -220,6 +164,7 @@ def test_predict_beat_chord_uses_the_given_beat_grid_and_skips_beat_decoding(
     export = captured["export"]
     assert export["beat_times"] == list(beat_grid.beat_times)
     assert export["meter_segments"] == list(beat_grid.meter_segments)
-    assert export["section_segments"] == list(beat_grid.section_segments)
+    # ビートトラッカーはセクションを出さないので、セクションのトラックは作らない。
+    assert "section_segments" not in export
     assert export["chord_segments"] is chord_segments
     assert export["key_segments"] is key_segments

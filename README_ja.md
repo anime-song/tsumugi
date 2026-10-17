@@ -64,6 +64,7 @@ uv run python -m instrument_agnostic_amt.amt.cli.infer --audio input_song.wav
 
 | 日付 | 更新内容 |
 | --- | --- |
+| 2026-10-17 | 🥁 `beat_source="sheetsage2"` を SheetSage2-Refined 0.2.0 のビートトラッカーに切り替え。デコーダーを使わずにビート・ダウンビート・小節ごとの拍子を推定します。変拍子の曲でダウンビート F が 0.835→0.883、小節の検出率が 0.661→0.752 に向上し、GPU で 1 曲数秒で動きます。セクションはデコーダーの出力だったため、`Predicted Sections` トラックは出力しなくなりました。 |
 | 2026-10-14 | 🥁 ビート・ダウンビート・拍子の推定に [SheetSage2-Refined](https://github.com/anime-song/SheetSage2-Refined) を追加し、デフォルトに設定（`beat_source="sheetsage2"`。`"tsumugi"` で従来のビートモデル）。ビートの推定精度が向上し、変拍子や拍子の変化にもより対応できるようになりました。曲のセクション（intro、verse、chorus など）も `Predicted Sections` トラックに出力。 |
 | 2026-09-01 | 🥁 Drum model v1.5（`--type drums_v1_5`）を追加し、Colab のドラムステムのデフォルトに設定。実音源評価セットで exact F1 は Drum Kit が 0.6157→0.6890（+7.3ポイント）、All Percussions が 0.1879→0.4044（+21.7ポイント）に向上。 |
 | 2026-08-25 | 🎤 Vocal harmony model v1.5（`--type vocal_harmony_v1_5`）を追加し、Colab の `vocals` ステムのデフォルトに設定。MIR-ST500 のホールドアウト分割で COnP が 0.6052 から 0.6814 に向上。 |
@@ -172,7 +173,7 @@ python -m instrument_agnostic_amt.amt.cli.infer --audio input_song.wav --compile
 
 ミックス全体を 1 回で処理するより遅いものの、通常は高い精度が得られます。各ステムの音響が単純になり、楽器の重なりが減るためです。差が特に大きいのは、密度の高いミックス、バンド録音、持続和音にメロディを重ねたアレンジです。
 
-`predict_beat_chord=True` のとき、`beat_source` でビート・拍子・セクションの推定元を選べます。`"sheetsage2"`（既定）は元音源から [SheetSage2-Refined](https://github.com/anime-song/SheetSage2-Refined) で推定し、セクションも `Predicted Sections` トラックに書き込みます。`"tsumugi"` は内蔵のビートモデルを使います。コードとキーは常に tsumugi の推定です。`uv sync --locked --extra stem --extra sheetsage` でインストールしてください。SheetSage2-Refined の重み（2.9 GB）は CC BY-NC 4.0（非商用のみ）です。
+`predict_beat_chord=True` のとき、`beat_source` でビート・拍子の推定元を選べます。`"sheetsage2"`（既定）は元音源から [SheetSage2-Refined](https://github.com/anime-song/SheetSage2-Refined) のビートトラッカー（デコーダーなし）で推定します。`"tsumugi"` は内蔵のビートモデルを使います。コードとキーは常に tsumugi の推定です。`uv sync --locked --extra stem --extra sheetsage` でインストールしてください。SheetSage2-Refined の重み（2.7 GB）は CC BY-NC 4.0（非商用のみ）です。
 
 ### 楽器再判定の単体実行
 

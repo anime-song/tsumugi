@@ -64,6 +64,7 @@ tsumugi works best on clean, sustained material where each stem is monophonic. A
 
 | Date | Update |
 | --- | --- |
+| 2026-10-17 | 🥁 Switched `beat_source="sheetsage2"` to the SheetSage2-Refined 0.2.0 beat tracker, which tracks beats, downbeats, and each bar's time signature without the decoder. On odd-meter songs, downbeat F improves from 0.835 to 0.883 and bars found from 0.661 to 0.752, and it runs in a few seconds per song on a GPU. The `Predicted Sections` track is no longer written, since sections came from the decoder. |
 | 2026-10-14 | 🥁 Added [SheetSage2-Refined](https://github.com/anime-song/SheetSage2-Refined) as the default source for beats, downbeats, and time signatures (`beat_source="sheetsage2"`; `"tsumugi"` keeps the built-in beat model). Beat tracking is more accurate and handles odd meters and meter changes better. Song sections (intro, verse, chorus, ...) are written to a `Predicted Sections` track. |
 | 2026-09-01 | 🥁 Added Drum model v1.5 (`--type drums_v1_5`) and made it the Colab default for drum stems. On the real-audio evaluation set (50 ms tolerance, audio-aligned, canonical drum pitches: 40→38 and 57→49), exact F1 improved from 0.6157 to 0.6890 for Drum Kit (+7.3 points) and from 0.1879 to 0.4044 for All Percussions (+21.7 points). |
 | 2026-08-25 | 🎤 Added Vocal Harmony model v1.5 (`--type vocal_harmony_v1_5`) and made it the Colab default for `vocals` stems. COnP improved from 0.6052 to 0.6814 on the held-out MIR-ST500 split. |
@@ -170,7 +171,7 @@ The first window pays the compilation cost, so a short one-off transcription may
 
 It is slower than a single pass over the mix, but usually more accurate because each stem is acoustically simpler and contains fewer overlapping instruments. The benefit is greatest for dense mixes, band recordings, and arrangements with sustained chords under a melody.
 
-With `predict_beat_chord=True`, `beat_source` chooses where beats, time signatures, and sections come from. `"sheetsage2"` (default) uses [SheetSage2-Refined](https://github.com/anime-song/SheetSage2-Refined) on the original mix and also writes sections to a `Predicted Sections` track; `"tsumugi"` uses the built-in beat model. Chords and keys always come from tsumugi. Install with `uv sync --locked --extra stem --extra sheetsage`. The SheetSage2-Refined weights (2.9 GB) are CC BY-NC 4.0 (non-commercial use only).
+With `predict_beat_chord=True`, `beat_source` chooses where beats and time signatures come from. `"sheetsage2"` (default) runs the [SheetSage2-Refined](https://github.com/anime-song/SheetSage2-Refined) beat tracker (no decoder) on the original mix; `"tsumugi"` uses the built-in beat model. Chords and keys always come from tsumugi. Install with `uv sync --locked --extra stem --extra sheetsage`. The SheetSage2-Refined weights (2.7 GB) are CC BY-NC 4.0 (non-commercial use only).
 
 ### Standalone instrument refinement
 

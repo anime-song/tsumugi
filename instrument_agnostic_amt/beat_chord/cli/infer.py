@@ -674,7 +674,6 @@ def predict_beat_chord_for_midi(
     ``beat_grid`` を渡すと、ビート・拍子はそれ (SheetSage2-Refined の推定) を
     そのまま使い、このモデルからはコードとキーだけを取る。tsumugi 側のビート
     復号と音声テンポ解析は走らせないので ``audio_path`` は使われない。
-    セクションがあれば "Predicted Sections" トラックとして書き込む。
     """
     input_midi_file = Path(input_midi_path).resolve()
     if not input_midi_file.exists():
@@ -755,11 +754,9 @@ def predict_beat_chord_for_midi(
     if beat_grid is None:
         beat_times = result.beat_times
         meter_segments = build_meter_segment_specs(result)
-        section_segments = []
     else:
         beat_times = list(beat_grid.beat_times)
         meter_segments = list(beat_grid.meter_segments)
-        section_segments = list(beat_grid.section_segments)
     export_tempo_mapped_midi(
         source_midi_path=input_midi_file,
         output_midi_path=output_midi_file,
@@ -767,7 +764,6 @@ def predict_beat_chord_for_midi(
         meter_segments=meter_segments,
         chord_segments=result.chord_segments,
         key_segments=result.key_segments,
-        section_segments=section_segments,
         duration_seconds=result.duration_seconds,
         ticks_per_beat=config.beat_mapped_ticks_per_beat,
     )
