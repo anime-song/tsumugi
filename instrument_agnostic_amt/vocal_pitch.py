@@ -43,6 +43,10 @@ PROJ_PERIODS = 4.0
 PROJ_MIN = 128
 PROJ_MAX = 2048
 MAX_HARMONICS = 200
+PITCH_CURVE_DEG = 2
+PITCH_CURVE_MAX_CENTS = 35.0
+PITCH_CURVE_MIN_LEN = 4
+PITCH_CURVE_BLEND = 2
 POLY_DEG = 6
 POLY_MAX_K = 15
 
@@ -344,6 +348,89 @@ def _median_filter(f0: np.ndarray, voiced: np.ndarray, width: int = 5) -> np.nda
     return out
 
 
+def fit_pitch_curve(f0: np.ndarray, voiced: np.ndarray, hop_seconds: float,
+                    deg: int = PITCH_CURVE_DEG,
+                    max_cents: float = PITCH_CURVE_MAX_CENTS,
+                    min_len: int = PITCH_CURVE_MIN_LEN) -> list[dict]:
+    """Fit the log2(f0) track with piecewise polynomials.
+
+    Segments are split recursively until the fit stays within `max_cents`, so the
+    curve is smooth where the pitch is steady and still follows vibrato and
+    glides. Returns [{'start', 'count', 'coef', 'span'}], with `coef` applied to
+    u = (t - t0) / span.
+    """
+    segs: list[dict] = []
+    idx = np.nonzero(voiced)[0]
+    if idx.size == 0:
+        return segs
+    breaks = np.nonzero(np.diff(idx) > 1)[0]
+    starts = np.concatenate([[0], breaks + 1])
+    ends = np.concatenate([breaks, [idx.size - 1]])
+
+    def add(a: int, b: int) -> None:
+        n = b - a + 1
+        t = (idx[a:b + 1] - idx[a]) * hop_seconds
+        y = np.log2(np.maximum(f0[idx[a:b + 1]], 1e-6))
+        d = min(deg, max(0, n - 1))
+        span = float(max(t[-1] - t[0], 1e-9)) if n > 1 else 1e-9
+        u = (t - t[0]) / span if n > 1 else np.zeros(1)
+        coef = np.polyfit(u, y, d) if n > d else np.array([float(y.mean())])
+        err = np.polyval(coef, u) - y
+        if n <= min_len or float(np.max(np.abs(err))) * 1200.0 <= max_cents:
+            segs.append({"start": int(idx[a]), "count": int(n),
+                         "coef": coef, "span": span})
+            return
+        mid = (a + b) // 2
+        add(a, mid)
+        add(mid + 1, b)
+
+    for s, e in zip(starts, ends):
+        add(int(s), int(e))
+    segs.sort(key=lambda s: s["start"])
+    return segs
+
+
+def eval_pitch_curve(segs: list[dict], n_frames: int, hop_seconds: float,
+                     blend: int = PITCH_CURVE_BLEND) -> np.ndarray:
+    """Rebuild per-frame f0 (Hz) from the fitted segments.
+
+    Neighbouring segments are cross-faded over a couple of frames, otherwise the
+    join shows up as a step in the pitch bend.
+    """
+    n_frames = int(n_frames)
+    f0 = np.zeros(n_frames)
+    val = np.zeros(n_frames)
+    for s in segs:
+        a, n = int(s["start"]), int(s["count"])
+        if n <= 0:
+            continue
+        if n == 1:
+            f0[a] = 2.0 ** float(np.polyval(s["coef"], 0.0))
+            val[a] = 1.0
+            continue
+        t = np.arange(a, a + n) * hop_seconds
+        u = (t - t[0]) / s["span"]
+        f0[a:a + n] = 2.0 ** np.polyval(s["coef"], u)
+        val[a:a + n] = 1.0
+
+    for s in segs[1:]:
+        a = int(s["start"])
+        for j in range(max(0, a - blend), min(n_frames, a + blend)):
+            w = (j - (a - blend)) / max(2 * blend, 1)
+            prev = None
+            for sp in segs:
+                b = int(sp["start"])
+                if b <= j < b + int(sp["count"]) and b < a:
+                    if int(sp["count"]) > 1:
+                        t = j * hop_seconds - b * hop_seconds
+                        prev = 2.0 ** float(np.polyval(sp["coef"], t / sp["span"]))
+                    else:
+                        prev = 2.0 ** float(np.polyval(sp["coef"], 0.0))
+            if prev is not None and val[j] > 0:
+                f0[j] = (1.0 - w) * prev + w * f0[j]
+    return f0
+
+
 def _median_smooth(f0: np.ndarray, voiced: np.ndarray, width: int = 5) -> np.ndarray:
     """Replace frames that sit more than 4 semitones away from the local median."""
     out = f0.copy()
@@ -553,6 +640,9 @@ def analyze_array(x: np.ndarray, sample_rate: int = SAMPLE_RATE) -> VocalTrack:
             harm_poly_ok[i] = True
 
     f0_track = _median_smooth(f0_track, voiced, 5)
+    curve = eval_pitch_curve(fit_pitch_curve(f0_track, voiced, hop / sample_rate),
+                             nfr, hop / sample_rate)
+    f0_track = np.where(curve > 0, curve, f0_track)
     return VocalTrack(voiced, f0_track, peak_db, harm_band, centers, hop,
                       sample_rate, harm_poly, harm_poly_ok)
 
