@@ -29,6 +29,7 @@ N_COMPONENTS = 15          # port 1 has 16 channels; ch9 (drums) is skipped
 SKIP_CHANNELS = {9}
 BEND_RANGE_SEMI = 12.0     # pitch bend range set through RPN
 CC_GAIN_FLOOR = 0.20       # lowest linear gain of the CC curve, about -14 dB
+CC_STEP_MIN = 2            # smallest CC11 change worth writing, about 0.7 dB
 CC7_VALUE = 127            # channel volume for the vocal channels
 DUCK_CC7_VALUE = 90        # channel volume for original vocals tracks, leaves room for port 1
 # Instrument names the vocals stem can be split into
@@ -150,15 +151,17 @@ def _component_segments(track, k: int, sec2tick, gate_db: float) -> list[dict]:
     # the loudest frame of the same channel so dynamics stay within the channel.
     ref_db = max(db for sg in segs for _, db in sg["frames"])
     out_segs = []
+    last_val = None
     for sg in segs:
         expr_t = []
-        last_val = None
         for idx, db in sg["frames"]:
             ratio = 10.0 ** ((db - ref_db) / 20.0)
             gain = CC_GAIN_FLOOR + (1.0 - CC_GAIN_FLOOR) * ratio
             # GM2 volume curve: amplitude = (cc / 127) ** 2
             val = int(np.clip(round(127.0 * np.sqrt(gain)), 0, 127))
-            if val != last_val:
+            # The curve runs across segment boundaries, so a change below the
+            # audible step is dropped instead of being rewritten every frame.
+            if last_val is None or abs(val - last_val) >= CC_STEP_MIN:
                 expr_t.append((sec2tick(idx * hop), val))
                 last_val = val
         out_segs.append((sg["start"], sg["end"], sg["note"], sg["bends"], expr_t))
