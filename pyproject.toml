@@ -31,6 +31,10 @@ stem = [
 sheetsage = [
     "sheetsage2-refined",
 ]
+# transcribe_lyrics=True (ボーカルステムから faster-whisper で歌詞を起こす) 用。
+lyrics = [
+    "faster-whisper",
+]
 training = [
     "audiomentations",
     "pedalboard",

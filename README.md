@@ -173,6 +173,16 @@ It is slower than a single pass over the mix, but usually more accurate because 
 
 With `predict_beat_chord=True`, `beat_source` chooses where beats and time signatures come from. `"sheetsage2"` (default) runs the [SheetSage2-Refined](https://github.com/anime-song/SheetSage2-Refined) beat tracker (no decoder) on the original mix; `"tsumugi"` uses the built-in beat model. Chords and keys always come from tsumugi. Install with `uv sync --locked --extra stem --extra sheetsage`. The SheetSage2-Refined weights (2.7 GB) are CC BY-NC 4.0 (non-commercial use only).
 
+### Lyrics and vocal port (optional)
+
+Two optional steps work on the vocals stem. Both are off by default.
+
+`transcribe_lyrics=True` runs faster-whisper (word-level timestamps) on the vocals stem and writes the words as Lyric meta events, so the merged MIDI carries the lyrics and they open in software that displays them. `lyrics_confidence_threshold` skips the stem when language detection is unsure, and `whisper_lyrics_language` pins the language instead of auto-detecting. Install with `uv sync --locked --extra lyrics`.
+
+`vocal_port=True` writes a second MIDI port that reconstructs the vocal line as additive synthesis: the vocals stem is analyzed frame by frame (f0 plus per-harmonic band levels), and the first `vocal_port_components` harmonics (15) each get a channel on port 1, carrying the same program (`vocal_port_program`, default 79, GM 80 ocarina). Pitch bend is written per frame with RPN 0,0 setting a ±12 semitone range, so glides and vibrato stay. Notes are cut at amplitude gates, and loudness is carried by a per-frame CC11 curve that follows the GM2 volume response. Channel volume is 127, while the instrument tracks fall back to the MIDI default of 100 and the original vocals tracks are ducked to `vocal_port_duck_cc7` (90) so they do not mask the new port. The analysis lives in `instrument_agnostic_amt/vocal_pitch.py` and needs nothing beyond numpy and scipy.
+
+The layout follows the two-port convention used by Muse exports: port 0 for the accompaniment, port 1 for the vocal, one channel per harmonic. Files written this way need a player that honors port meta events — DAWs, MuseScore and most desktop sequencers handle them, while lightweight players and many phone apps either ignore port 1 or flatten everything into 16 channels. MIDI allows 128 ports / 2048 channels; in practice two is the useful limit.
+
 ### Standalone instrument refinement
 
 Reclassifies each note in an existing MIDI file using the stem it was transcribed from. Timing and pitch are preserved; only the track program and name change.
