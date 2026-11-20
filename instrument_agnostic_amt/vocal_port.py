@@ -23,12 +23,12 @@ import mido
 
 from instrument_agnostic_amt.vocal_pitch import analyze_vocals
 
-PROGRAM_DEFAULT = 80
-BANK_MSB_DEFAULT = 8
+PROGRAM_DEFAULT = 79       # GM 80 (ocarina)
+BANK_MSB_DEFAULT = 0
 N_COMPONENTS = 15          # port 1 has 16 channels; ch9 (drums) is skipped
 SKIP_CHANNELS = {9}
 BEND_RANGE_SEMI = 12.0     # pitch bend range set through RPN
-CC_FLOOR_FRAC = 0.45       # floor of the CC volume curve (0-1), compresses dynamics
+CC_GAIN_FLOOR = 0.20       # lowest linear gain of the CC curve, about -14 dB
 CC7_VALUE = 127            # channel volume for the vocal channels
 DUCK_CC7_VALUE = 90        # channel volume for original vocals tracks, leaves room for port 1
 # Instrument names the vocals stem can be split into
@@ -154,8 +154,10 @@ def _component_segments(track, k: int, sec2tick, gate_db: float) -> list[dict]:
         expr_t = []
         last_val = None
         for idx, db in sg["frames"]:
-            frac = CC_FLOOR_FRAC + (1.0 - CC_FLOOR_FRAC) * 10.0 ** ((db - ref_db) / 20.0)
-            val = int(np.clip(round(127.0 * frac), 0, 127))
+            ratio = 10.0 ** ((db - ref_db) / 20.0)
+            gain = CC_GAIN_FLOOR + (1.0 - CC_GAIN_FLOOR) * ratio
+            # GM2 volume curve: amplitude = (cc / 127) ** 2
+            val = int(np.clip(round(127.0 * np.sqrt(gain)), 0, 127))
             if val != last_val:
                 expr_t.append((sec2tick(idx * hop), val))
                 last_val = val
