@@ -1,9 +1,10 @@
 # -*- coding: utf-8 -*-
 """Vocal port mode: port 0 keeps the transcribed instruments, port 1 carries the vocals.
 
-The vocals stem is analyzed with voice-compress (YIN f0 + harmonic amplitudes) and
-the first N harmonics (15 by default) are rendered as additive synthesis, one MIDI
-channel per harmonic on port 1, all with a fixed program (bank 8 / program 80).
+The vocals stem is analyzed frame by frame (`vocal_pitch`): f0 plus one harmonic
+level curve per frame. The first N harmonics (15 by default) are rendered as
+additive synthesis, one MIDI channel per harmonic on port 1, all with a fixed
+program (bank 8 / program 80).
 
 Mapping rules:
 - RPN 0,0 sets pitch bend range to +-12 semitones at the start of every channel.
@@ -15,18 +16,12 @@ with a `midi_port` meta event (FF 21) set to port 1.
 """
 from __future__ import annotations
 
-import os
-import sys
 from pathlib import Path
 
 import numpy as np
+import mido
 
-# voice-compress is an optional dependency; set VOICE_COMPRESS_ROOT to its checkout.
-VC_ROOT = os.environ.get("VOICE_COMPRESS_ROOT", "")
-if VC_ROOT and VC_ROOT not in sys.path:
-    sys.path.insert(0, VC_ROOT)
-
-import mido  # noqa: E402
+from instrument_agnostic_amt.vocal_pitch import analyze_vocals
 
 PROGRAM_DEFAULT = 80
 BANK_MSB_DEFAULT = 8
@@ -34,79 +29,12 @@ N_COMPONENTS = 15          # port 1 has 16 channels; ch9 (drums) is skipped
 SKIP_CHANNELS = {9}
 BEND_RANGE_SEMI = 12.0     # pitch bend range set through RPN
 CC_FLOOR_FRAC = 0.45       # floor of the CC volume curve (0-1), compresses dynamics
-CC7_VALUE = 127            # channel volume for vocal channels (default 100 is too quiet)
+CC7_VALUE = 127            # channel volume for the vocal channels
 DUCK_CC7_VALUE = 90        # channel volume for original vocals tracks, leaves room for port 1
-# Instrument class names produced by the vocals stem (vocal_harmony_v1_5)
+# Instrument names the vocals stem can be split into
 VOCAL_STEM_INSTRUMENT_NAMES = {"melody", "vocal_harmony", "choir"}
 COMP_GATE_DB = 45.0        # component is muted when 45 dB below the global peak
 MIN_RUN_FRAMES = 2         # shortest note, in frames
-
-_FastYinInstalled = False
-
-
-def _install_fast_yin() -> None:
-    """Replace YIN evidence with an FFT implementation to speed up analysis."""
-    global _FastYinInstalled
-    if _FastYinInstalled:
-        return
-    import importlib
-    import vc.f0 as f0mod
-
-    def fast_yin_evidence(x, fs, candidates):
-        x = np.asarray(x, dtype=np.float64)
-        x = x - x.mean()
-        n = x.size
-        lag_max = int(np.ceil(fs / float(candidates.min()))) + 1
-        tau_max = min(n - 2, lag_max)
-        tau_min = max(2, int(np.floor(fs / float(candidates.max()))))
-        if tau_max <= tau_min + 1:
-            return np.zeros(candidates.size), 1.0
-        span = n - tau_max
-        if span < 8:
-            return np.zeros(candidates.size), 1.0
-        head = x[:span]
-        nfft = 1 << (n + span - 1).bit_length()
-        H = np.fft.rfft(head, nfft)
-        X = np.fft.rfft(x, nfft)
-        cross = np.fft.irfft(np.conj(H) * X, nfft)[: tau_max + 1]
-        cs = np.concatenate([[0.0], np.cumsum(x * x)])
-        tau = np.arange(tau_max + 1)
-        diff = (cs[span] + (cs[span + tau] - cs[tau])) - 2.0 * cross
-        diff[0] = 0.0
-        cmnd = np.ones(tau_max + 1)
-        running = np.cumsum(diff[1:])
-        nz = running > 0
-        cmnd[1:][nz] = diff[1:][nz] * np.arange(1, tau_max + 1)[nz] / running[nz]
-        lags = np.clip(fs / np.maximum(candidates, 1e-6), 1, tau_max)
-        ev = 1.0 - np.interp(lags, np.arange(tau_max + 1), cmnd)
-        aper = float(cmnd[tau_min : tau_max + 1].min()) if tau_max > tau_min else 1.0
-        return np.clip(ev, 0.0, 1.0), aper
-
-    f0mod.yin_evidence = fast_yin_evidence
-    importlib.import_module("vc.analyze").yin_evidence = fast_yin_evidence
-    _FastYinInstalled = True
-
-
-def analyze_vocals(wav_path: str | Path) -> object:
-    """Load a wav at any sample rate / channel count and return a ParamTrack."""
-    import soundfile as sf
-    try:
-        from vc.analyze import CodecConfig, analyze
-        from vc.dsp import resample
-    except ImportError as err:
-        raise ImportError(
-            "voice-compress is required for the vocal port; "
-            "set VOICE_COMPRESS_ROOT to its checkout."
-        ) from err
-
-    _install_fast_yin()
-    data, sr = sf.read(str(wav_path), dtype="float32", always_2d=True)
-    x = data.mean(axis=1)
-    if sr != 24000:
-        x = resample(x.astype(np.float64), sr, 24000)
-    cfg = CodecConfig()
-    return analyze(x.astype(np.float32), cfg)
-
 
 def _sec2tick_factory(mid: mido.MidiFile):
     """Seconds -> ticks using the project's own tempo converter.
