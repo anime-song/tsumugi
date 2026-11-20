@@ -43,18 +43,28 @@ PROJ_PERIODS = 4.0
 PROJ_MIN = 128
 PROJ_MAX = 2048
 MAX_HARMONICS = 200
+POLY_DEG = 6
+POLY_MAX_K = 15
 
 
 class VocalTrack:
-    """Per-frame vocal parameters: f0, voicing, harmonic level curve."""
+    """Per-frame vocal parameters: f0, voicing, harmonic level curve.
+
+    The level curve is available both as a band envelope and as a polynomial in
+    log2 frequency. The polynomial is what the MIDI stage samples, so harmonics
+    follow a smooth curve instead of stepping between band centres.
+    """
 
     def __init__(self, voiced, f0, harm_peak_db, harm_band_db, centers_h,
-                 hop_size=HOP_SIZE, sample_rate=SAMPLE_RATE):
+                 hop_size=HOP_SIZE, sample_rate=SAMPLE_RATE,
+                 harm_poly=None, harm_poly_ok=None):
         self.voiced = voiced
         self.f0 = f0
         self.harm_peak_db = harm_peak_db
         self.harm_band_db = harm_band_db
         self.centers_h = centers_h
+        self.harm_poly = harm_poly
+        self.harm_poly_ok = harm_poly_ok
         self.hop_size = hop_size
         self.sample_rate = sample_rate
 
@@ -424,6 +434,32 @@ def _eval_envelope(freqs: np.ndarray, band_db: np.ndarray,
                      left=float(band_db[0]), right=float(band_db[-1]))
 
 
+def fit_poly_curve(freqs: np.ndarray, amps: np.ndarray, deg: int = POLY_DEG,
+                   max_k: int = POLY_MAX_K):
+    """Polynomial fit of the harmonic levels in log2 frequency.
+
+    Amplitudes are made relative to the frame peak, so the result pairs with
+    `harm_peak_db`. Returns packed coefficients `[f_ref, c_0, ...]`, or None
+    when fewer than two usable harmonics are left.
+    """
+    good = np.isfinite(amps) & (amps > 0) & np.isfinite(freqs) & (freqs > 0)
+    good[max_k:] = False
+    if int(np.count_nonzero(good)) < 2:
+        return None
+    f_h = freqs[good]
+    db_rel = 20.0 * np.log10(amps[good] + 1e-30)
+    db_rel = db_rel - float(db_rel.max())
+    u = np.log2(np.maximum(f_h, 1e-6) / float(f_h.min()))
+    d = int(min(deg, u.size - 1))
+    coef = np.polyfit(u, db_rel, d)
+    return np.concatenate([[float(f_h.min())], coef])
+
+
+def eval_poly_curve(freqs: np.ndarray, packed: np.ndarray) -> np.ndarray:
+    """Evaluate a packed curve at the given frequencies (relative dB)."""
+    return np.polyval(packed[1:], np.log2(np.maximum(freqs, 1e-6) / packed[0]))
+
+
 def _proj_length(f0: float) -> int:
     length = int(round(PROJ_PERIODS * SAMPLE_RATE / max(f0, 1e-6)))
     length = int(np.clip(length, PROJ_MIN, PROJ_MAX))
@@ -480,6 +516,8 @@ def analyze_array(x: np.ndarray, sample_rate: int = SAMPLE_RATE) -> VocalTrack:
     f0_track = np.zeros(nfr)
     peak_db = np.full(nfr, -100.0)
     harm_band = np.full((nfr, centers.size), HARM_FLOOR_DB)
+    harm_poly = np.zeros((nfr, POLY_DEG + 2))
+    harm_poly_ok = np.zeros(nfr, dtype=bool)
 
     for i in range(nfr):
         if not (voiced_pred[i] and valid[i]) or f0_refined[i] <= 0:
@@ -498,6 +536,7 @@ def analyze_array(x: np.ndarray, sample_rate: int = SAMPLE_RATE) -> VocalTrack:
         amps = _project_harmonics_joint(proj_seg, _vorbis_window(proj_len),
                                         sample_rate, freqs)
         band_db, peak = _fit_envelope(freqs, amps, centers)
+        packed = fit_poly_curve(freqs, amps)
         # The band fit averages over peaks, so it reads slightly below the
         # projected amplitudes. Fold the energy ratio back into the peak level.
         a_fit = 10.0 ** ((_eval_envelope(freqs, band_db, centers) + peak) / 20.0)
@@ -509,10 +548,13 @@ def analyze_array(x: np.ndarray, sample_rate: int = SAMPLE_RATE) -> VocalTrack:
         f0_track[i] = f0_i
         harm_band[i] = band_db
         peak_db[i] = peak
+        if packed is not None:
+            harm_poly[i] = packed
+            harm_poly_ok[i] = True
 
     f0_track = _median_smooth(f0_track, voiced, 5)
     return VocalTrack(voiced, f0_track, peak_db, harm_band, centers, hop,
-                      sample_rate)
+                      sample_rate, harm_poly, harm_poly_ok)
 
 
 def analyze_vocals(wav_path) -> VocalTrack:

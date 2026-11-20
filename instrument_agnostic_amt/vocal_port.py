@@ -21,7 +21,7 @@ from pathlib import Path
 import numpy as np
 import mido
 
-from instrument_agnostic_amt.vocal_pitch import analyze_vocals
+from instrument_agnostic_amt.vocal_pitch import analyze_vocals, eval_poly_curve
 
 PROGRAM_DEFAULT = 79       # GM 80 (ocarina)
 BANK_MSB_DEFAULT = 0
@@ -31,6 +31,7 @@ BEND_RANGE_SEMI = 12.0     # pitch bend range set through RPN
 CC_GAIN_FLOOR = 0.20       # lowest linear gain of the CC curve, about -14 dB
 CC_STEP_MIN = 2            # smallest CC11 change worth writing, about 0.7 dB
 SMOOTH_FRAMES = 9          # temporal low-pass width for the level curve, in frames
+REL_DB_FLOOR = -72.0       # level floor of the harmonic curve, relative to the frame peak
 CC7_VALUE = 127            # channel volume for the vocal channels
 DUCK_CC7_VALUE = 90        # channel volume for original vocals tracks, leaves room for port 1
 # Instrument names the vocals stem can be split into
@@ -82,6 +83,23 @@ def _build_channel_events(run: dict, ch: int, program: int, bank_msb: int,
     return ev
 
 
+def _harmonic_rel_db(track, i: int, freq: float) -> float:
+    """Level of one harmonic relative to the frame peak.
+
+    Prefers the polynomial curve fitted in log2 frequency, which stays
+    continuous while f0 moves; falls back to the band envelope when a frame
+    had too few harmonics to fit.
+    """
+    poly = getattr(track, "harm_poly", None)
+    ok = getattr(track, "harm_poly_ok", None)
+    if poly is not None and ok is not None and ok[i]:
+        rel = float(eval_poly_curve(np.array([freq]), poly[i])[0])
+    else:
+        rel = float(np.interp(np.log2(freq), np.log2(track.centers_h),
+                              track.harm_band_db[i]))
+    return float(np.clip(rel, REL_DB_FLOOR, 0.0))
+
+
 def _smooth_frame_levels(frames: list) -> None:
     """Low-pass the per-frame levels in place.
 
@@ -123,7 +141,7 @@ def _component_segments(track, k: int, sec2tick, gate_db: float) -> list[dict]:
         if freq > f_max:
             frames.append(None)
             continue
-        rel_db = float(np.interp(np.log2(freq), np.log2(track.centers_h), track.harm_band_db[i]))
+        rel_db = _harmonic_rel_db(track, i, freq)
         abs_db = float(track.harm_peak_db[i]) + rel_db
         if abs_db < gate_db:
             frames.append(None)
