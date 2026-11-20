@@ -30,6 +30,7 @@ SKIP_CHANNELS = {9}
 BEND_RANGE_SEMI = 12.0     # pitch bend range set through RPN
 CC_GAIN_FLOOR = 0.20       # lowest linear gain of the CC curve, about -14 dB
 CC_STEP_MIN = 2            # smallest CC11 change worth writing, about 0.7 dB
+SMOOTH_FRAMES = 9          # temporal low-pass width for the level curve, in frames
 CC7_VALUE = 127            # channel volume for the vocal channels
 DUCK_CC7_VALUE = 90        # channel volume for original vocals tracks, leaves room for port 1
 # Instrument names the vocals stem can be split into
@@ -81,6 +82,27 @@ def _build_channel_events(run: dict, ch: int, program: int, bank_msb: int,
     return ev
 
 
+def _smooth_frame_levels(frames: list) -> None:
+    """Low-pass the per-frame levels in place.
+
+    Frames the gate drops become holes; they are bridged by linear interpolation
+    first so the filter never sees the gaps, then only the gated frames are
+    written back. The kernel spans a few frames, well below the vibrato rate.
+    """
+    idx = [i for i, f in enumerate(frames) if f is not None]
+    if len(idx) < 3:
+        return
+    db = np.array([frames[i][1] for i in idx], dtype=np.float64)
+    full = np.interp(np.arange(len(frames)), idx, db)
+    half = SMOOTH_FRAMES // 2
+    if half > 0:
+        taps = np.exp(-0.5 * (np.arange(-half, half + 1) / (0.5 * half)) ** 2)
+        taps /= taps.sum()
+        full = np.convolve(np.pad(full, half, mode="edge"), taps, mode="valid")
+    for i in idx:
+        frames[i] = (frames[i][0], float(full[i]))
+
+
 def _component_segments(track, k: int, sec2tick, gate_db: float) -> list[dict]:
     """Note segments of harmonic k, split at gate boundaries.
 
@@ -107,6 +129,8 @@ def _component_segments(track, k: int, sec2tick, gate_db: float) -> list[dict]:
             frames.append(None)
         else:
             frames.append((freq, abs_db))
+
+    _smooth_frame_levels(frames)
 
     segs = []
     i = 0
