@@ -96,7 +96,7 @@ class RenderCompareVelocityConfig:
     chord_voicing_strength: float = 0.50
     optimize_volume_cc7: bool = True
     max_step_error_db: float = 14.0
-    max_within_stem_track_offset_db: float = 6.0
+    max_within_stem_track_offset_db: float = 14.0
     local_smoothing_strength: float = 0.30
     vocal_smoothing_strength: float = 0.48
     # 分離器のマスク減衰と GM マスキングを補償するため、伴奏が大きい区間ほどボーカルを持ち上げ、
@@ -106,9 +106,10 @@ class RenderCompareVelocityConfig:
     # フィードバックして Aメロ〜サビのフルミックス整合性を取る (0.0 で無効)。
     full_mix_feedback_weight: float = 0.45
     full_mix_window_seconds: float = 0.25
-    # 1-C: ステレオ分離ステムからの左右パン (CC#10) 抽出。
+    # 1-C / 1-G: ステレオ分離ステムからの左右パン (CC#10) 抽出、およびダブルギター等の (L)/(C)/(R) 自動分割。
     # 持続系楽器の動的強弱 (CC#11) は SoundFont のアタックと干渉しやすいため既定では無効（オプトイン）。
     optimize_pan_cc10: bool = True
+    split_stereo_pan_tracks: bool = True
     optimize_expression_cc11: bool = False
     max_melodic_instruments: int = 15
     evaluate_final: bool = True
@@ -142,7 +143,7 @@ class RenderCompareVelocityConfig:
 
 @dataclass
 class _TrackState:
-    """最適化対象の 1 トラック分の状態（MIDI トラック参照と現在の CC#7）。"""
+    """最適化対象の 1 トラック分の状態（MIDI トラック参照と現在の CC#7 / CC#10 / 空間ゾーン）。"""
 
     track_key: int
     stem_name: str
@@ -153,6 +154,8 @@ class _TrackState:
     instrument: pretty_midi.Instrument
     volume_cc7: float
     is_monophonic: bool
+    pan_cc10: int = 64
+    spatial_zone: str = "mono"  # "mono" | "left" | "center" | "right"
 
 
 @dataclass
@@ -379,6 +382,7 @@ def _measure_stem_acoustics(
     pitch_filterbank: np.ndarray,
     drum_filterbank: np.ndarray,
     chord_voicing_strength: float,
+    stereo_audio: np.ndarray | None = None,
     pitch_min: int = 21,
     pitch_max: int = 108,
 ) -> _StemAcousticMeasurement:
@@ -436,6 +440,52 @@ def _measure_stem_acoustics(
     has_melodic = any(not item.is_drum for item in stem_notes)
     pitch_energy = (pitch_filterbank @ k_power) if has_melodic else None
 
+    # ステレオ分割サブトラック ("left" / "center" / "right") が存在する場合、
+    # 元ステムとレンダリングの両方に同一の L/C/R 空間分離マスクを適用し、
+    # 左右バッキングと中央ソロの音量・ダイナミクスを独立して計測できるようにする。
+    spatial_broadband_by_zone: dict[str, np.ndarray] = {}
+    spatial_pitch_by_zone: dict[str, np.ndarray] = {}
+    needed_zones = {track_state.spatial_zone for track_state in stem_tracks if track_state.spatial_zone != "mono"}
+    if needed_zones and stereo_audio is not None and stereo_audio.ndim == 2 and int(stereo_audio.shape[0]) == 2:
+        left_k = _apply_k_weighting(stereo_audio[0], sample_rate=sample_rate)
+        right_k = _apply_k_weighting(stereo_audio[1], sample_rate=sample_rate)
+        if left_k.size < n_fft:
+            pad_len = n_fft - left_k.size
+            left_k = np.pad(left_k, (0, pad_len))
+            right_k = np.pad(right_k, (0, pad_len))
+        stereo_spectrum = torch.stft(
+            torch.from_numpy(np.stack((left_k, right_k), axis=0)),
+            n_fft=n_fft,
+            hop_length=hop_length,
+            win_length=n_fft,
+            window=window,
+            center=True,
+            return_complex=True,
+        )
+        # 複素クロススペクトルによるエネルギー保存型の L/C/R 空間分解:
+        #   center = max(0, Re(L·conj(R)))        -> 同相の中央ソロだけを抽出し、無相関な L+R バッキングを除去
+        #   left   = max(0, |L|^2 - center)       -> 中央ソロと同時発音しても左バッキング単独パワーを分離
+        #   right  = max(0, |R|^2 - center)       -> 中央ソロと同時発音しても右バッキング単独パワーを分離
+        # 元ステム音声と FluidSynth レンダリング音声の両方に同一式を適用するため定数ゲイン差は相殺される。
+        left_real = stereo_spectrum[0].real.numpy()
+        left_imag = stereo_spectrum[0].imag.numpy()
+        right_real = stereo_spectrum[1].real.numpy()
+        right_imag = stereo_spectrum[1].imag.numpy()
+        left_power = (left_real * left_real + left_imag * left_imag) / max(window_energy, 1e-8)
+        right_power = (right_real * right_real + right_imag * right_imag) / max(window_energy, 1e-8)
+        center_power = np.maximum(0.0, left_real * right_real + left_imag * right_imag) / max(window_energy, 1e-8)
+
+        zone_power_maps: dict[str, np.ndarray] = {}
+        if "left" in needed_zones:
+            zone_power_maps["left"] = np.maximum(0.0, left_power - center_power)
+        if "right" in needed_zones:
+            zone_power_maps["right"] = np.maximum(0.0, right_power - center_power)
+        if "center" in needed_zones:
+            zone_power_maps["center"] = center_power
+        for zone_name, zone_power in zone_power_maps.items():
+            spatial_broadband_by_zone[zone_name] = (broadband_weights @ zone_power) / float(n_fft)
+            spatial_pitch_by_zone[zone_name] = pitch_filterbank @ zone_power
+
     # 2. マクロ計測：ステム全体およびトラックごとのアクティブ区間 K-weighted LUFS (dB)。
     stem_active_mask = np.zeros(num_frames, dtype=np.bool_)
     track_active_masks: dict[int, np.ndarray] = {}
@@ -459,6 +509,7 @@ def _measure_stem_acoustics(
     stem_active_lufs_db = float(10.0 * math.log10(max(stem_mean_power, 1e-12)))
 
     # 同一ステム内に複数トラックがある場合、他トラックと重ならない単独発音フレームからトラック別 LUFS を測る。
+    # ステレオ空間分割されたサブトラック (L/C/R) は対応する空間分離パワー上でアクティブ全区間から直接計測する。
     track_count_per_frame = np.zeros(num_frames, dtype=np.int32)
     for mask in track_active_masks.values():
         track_count_per_frame += mask.astype(np.int32)
@@ -466,6 +517,16 @@ def _measure_stem_acoustics(
     track_active_lufs_db: dict[int, float] = {}
     for track_state in stem_tracks:
         mask = track_active_masks[track_state.track_key]
+        if track_state.spatial_zone in spatial_broadband_by_zone and int(mask.sum()) >= 4:
+            zone_series = spatial_broadband_by_zone[track_state.spatial_zone]
+            common_mask = mask[: zone_series.size]
+            zone_powers = zone_series[common_mask]
+            zone_gate = float(np.percentile(zone_powers, 90)) * (10.0 ** (-20.0 / 10.0))
+            zone_gated = zone_powers[zone_powers >= zone_gate]
+            mean_zone_power = float(np.mean(zone_gated)) if zone_gated.size > 0 else float(np.mean(zone_powers))
+            track_active_lufs_db[track_state.track_key] = float(10.0 * math.log10(max(mean_zone_power, 1e-12)))
+            continue
+
         solo_mask = mask & (track_count_per_frame == 1)
         if int(solo_mask.sum()) >= 8:
             powers = broadband_frame_power[solo_mask]
@@ -513,6 +574,11 @@ def _measure_stem_acoustics(
                 note_levels_db[note_state.note_id] = float(10.0 * math.log10(max(onset_power, 1e-12)))
             continue
 
+        # ステレオ分割サブトラックは対応する空間分離パワー列を使う。
+        active_broadband = spatial_broadband_by_zone.get(track_state.spatial_zone, broadband_frame_power)
+        active_pitch_energy = spatial_pitch_by_zone.get(track_state.spatial_zone, pitch_energy)
+        active_num_frames = int(active_broadband.size)
+
         # 3-a. 単音系（vocals / bass / 単音リード）:
         #      K-weighted 広帯域パワーをノート区間全体（最大 0.35 秒）で計測する。
         #      ビブラート・しゃくり・母音（フォルマント）変化でノートごとにガタつかない。
@@ -521,19 +587,19 @@ def _measure_stem_acoustics(
         for note_state in track_notes:
             note_duration = max(0.04, note_state.end_seconds - note_state.start_seconds)
             measure_duration = min(note_duration, 0.35 if track_state.is_monophonic else 0.22)
-            start_frame = max(0, min(num_frames - 1, int(math.floor(note_state.start_seconds * frames_per_second))))
+            start_frame = max(0, min(active_num_frames - 1, int(math.floor(note_state.start_seconds * frames_per_second))))
             end_frame = min(
-                num_frames,
+                active_num_frames,
                 max(start_frame + 1, int(math.ceil((note_state.start_seconds + measure_duration) * frames_per_second))),
             )
-            broadband_segment = broadband_frame_power[start_frame:end_frame]
+            broadband_segment = active_broadband[start_frame:end_frame]
             # 上位 75 パーセンタイルを使い、オンセット微小ズレ (20〜40ms) による凹みを吸収する。
             broadband_power = float(np.percentile(broadband_segment, 75)) if broadband_segment.size > 0 else 1e-12
             broadband_db_by_note[note_state.note_id] = float(10.0 * math.log10(max(broadband_power, 1e-12)))
 
-            if pitch_energy is not None:
+            if active_pitch_energy is not None:
                 clamped_pitch = max(pitch_min, min(pitch_max, int(note_state.pitch)))
-                pitch_segment = pitch_energy[clamped_pitch - pitch_min, start_frame:end_frame]
+                pitch_segment = active_pitch_energy[clamped_pitch - pitch_min, start_frame:end_frame]
                 pitch_power = float(np.percentile(pitch_segment, 75)) if pitch_segment.size > 0 else 1e-12
                 pitch_db_by_note[note_state.note_id] = float(10.0 * math.log10(max(pitch_power, 1e-12)))
 
@@ -669,6 +735,13 @@ def _build_packed_stems_midi(
                 (start_tick, 2, mido.Message("control_change", channel=channel, control=7, value=volume_value, time=0))
             )
             scheduled_events.append(
+                (
+                    start_tick,
+                    2,
+                    mido.Message("control_change", channel=channel, control=10, value=int(track_state.pan_cc10), time=0),
+                )
+            )
+            scheduled_events.append(
                 (start_tick, 2, mido.Message("control_change", channel=channel, control=11, value=127, time=0))
             )
             scheduled_events.append(
@@ -773,8 +846,12 @@ def _smooth_track_velocities(
     track_min_velocity = _min_velocity_for_track(track_state, config)
 
     # ボーカルはフレーズ全体（前後 0.8 秒・最大 3 ノート）で滑らかに繋ぎ、他は 0.45 秒以内で平滑化する。
+    # 非ボーカル・非ドラムでは音高差 7 半音以内の同音域ノートを優先することで、
+    # 同時発音する高音ソロ／リードが低音バッキング和音の中央値へ引きずられるのを防ぐ。
     radius_notes = 3 if "vocal" in track_state.stem_name else 2
     radius_seconds = 0.80 if "vocal" in track_state.stem_name else 0.45
+    filter_by_pitch = (not track_state.is_drum) and ("vocal" not in track_state.stem_name)
+    pitches = np.asarray([int(item.pitch) for item in ordered], dtype=np.int32)
 
     for index in range(len(ordered)):
         left = max(0, index - radius_notes)
@@ -783,6 +860,7 @@ def _smooth_track_velocities(
             raw_velocities[neighbor]
             for neighbor in range(left, right)
             if abs(starts[neighbor] - starts[index]) <= radius_seconds
+            and ((not filter_by_pitch) or abs(int(pitches[neighbor]) - int(pitches[index])) <= 7)
         ]
         if len(neighbors) >= 3:
             local_median = float(np.median(neighbors))
@@ -976,20 +1054,71 @@ def optimize_velocity_and_mix_by_render_compare(
         tracks_by_stem[stem_name] = []
         notes_by_stem[stem_name] = []
 
+    # 1.5 (1-G) ステレオ左右パンに明確に分かれたダブルトラック（ダブルギター＋中央ソロ等）を
+    #     MIDI 16ch 予算の範囲内で (L)/(C)/(R) サブトラックへ自動分割する。
+    stereo_split_reports: list[dict[str, Any]] = []
+    if config.split_stereo_pan_tracks and config.optimize_pan_cc10:
+        from .expression_pan import ExpressionPanConfig, split_stereo_pan_tracks_in_stem_midi
+
+        major_melodic_count = sum(
+            1
+            for midi_object in loaded_midis.values()
+            for instrument in midi_object.instruments
+            if not instrument.is_drum and len(instrument.notes) >= 30
+        )
+        # 16ch 枠（最大 max_melodic_instruments 本）を圧迫しない範囲で優先ステムから分割予算を配分する。
+        remaining_split_budget = max(2, min(4, int(config.max_melodic_instruments) - major_melodic_count))
+        split_config = ExpressionPanConfig(sample_rate=sample_rate)
+        # guitar -> other -> piano の順でダブルトラック効果の大きいステムから優先分割する。
+        preferred_order = sorted(
+            loaded_midis,
+            key=lambda name: (0 if "guitar" in name else (1 if "other" in name else 2), name),
+        )
+        for stem_name in preferred_order:
+            if remaining_split_budget <= 0:
+                break
+            reports_for_stem = split_stereo_pan_tracks_in_stem_midi(
+                loaded_midis[stem_name],
+                target_stereo_waveforms[stem_name],
+                stem_name=stem_name,
+                config=split_config,
+                max_extra_tracks=remaining_split_budget,
+            )
+            for item in reports_for_stem:
+                remaining_split_budget -= max(0, len(item["subtracks"]) - 1)
+                stereo_split_reports.append(item)
+
+    for stem_name in active_stems:
+        midi_object = loaded_midis[stem_name]
         for instrument_index, instrument in enumerate(midi_object.instruments):
             if not instrument.notes:
                 continue
             track_key = len(tracks)
+            instrument_name_str = str(instrument.name)
+            if instrument_name_str.endswith(" (L)"):
+                spatial_zone = "left"
+            elif instrument_name_str.endswith(" (C)"):
+                spatial_zone = "center"
+            elif instrument_name_str.endswith(" (R)"):
+                spatial_zone = "right"
+            else:
+                spatial_zone = "mono"
+            initial_pan = next(
+                (int(control.value) for control in instrument.control_changes if int(control.number) == 10),
+                64,
+            )
             track_state = _TrackState(
                 track_key=track_key,
                 stem_name=stem_name,
                 instrument_index=instrument_index,
                 program_number=int(instrument.program),
                 is_drum=bool(instrument.is_drum),
-                instrument_name=str(instrument.name),
+                instrument_name=instrument_name_str,
                 instrument=instrument,
                 volume_cc7=float(config.initial_volume_cc7),
                 is_monophonic=False,
+                pan_cc10=int(np.clip(initial_pan, 0, 127)),
+                spatial_zone=spatial_zone,
             )
             tracks.append(track_state)
             tracks_by_stem[stem_name].append(track_state)
@@ -1051,6 +1180,7 @@ def optimize_velocity_and_mix_by_render_compare(
             pitch_filterbank=pitch_filterbank,
             drum_filterbank=drum_filterbank,
             chord_voicing_strength=float(config.chord_voicing_strength),
+            stereo_audio=target_stereo_waveforms[stem_name],
         )
 
     # 2.5 元フルミックスの目標ラウドネス推移と、ボーカル用の伴奏ラウドネス推移を事前計算する。
@@ -1142,15 +1272,24 @@ def optimize_velocity_and_mix_by_render_compare(
             if int(rendered_sample_rate) != sample_rate:
                 raise ValueError(f"Rendered sample rate mismatch: expected {sample_rate}, got {rendered_sample_rate}")
             rendered_mono = rendered_full.mean(axis=1).astype(np.float32, copy=False)
+            rendered_stereo_full = (
+                rendered_full[:, :2].T.copy()
+                if rendered_full.shape[1] >= 2
+                else np.repeat(rendered_full.T, 2, axis=0)
+            )
             total_rendered_samples = int(rendered_mono.size)
 
             rendered_by_stem: dict[str, _StemAcousticMeasurement] = {}
             for slot in slots:
                 expected_samples = int(target_waveforms[slot.stem_name].size)
                 start_sample = max(0, int(round(slot.slot_start_seconds * sample_rate)))
-                segment = rendered_mono[start_sample : min(total_rendered_samples, start_sample + expected_samples)]
+                end_sample = min(total_rendered_samples, start_sample + expected_samples)
+                segment = rendered_mono[start_sample:end_sample]
+                stereo_segment = rendered_stereo_full[:, start_sample:end_sample]
                 if segment.size < expected_samples:
-                    segment = np.pad(segment, (0, expected_samples - segment.size))
+                    pad_width = expected_samples - segment.size
+                    segment = np.pad(segment, (0, pad_width))
+                    stereo_segment = np.pad(stereo_segment, ((0, 0), (0, pad_width)))
                 rendered_by_stem[slot.stem_name] = _measure_stem_acoustics(
                     segment,
                     tracks_by_stem[slot.stem_name],
@@ -1162,6 +1301,7 @@ def optimize_velocity_and_mix_by_render_compare(
                     pitch_filterbank=pitch_filterbank,
                     drum_filterbank=drum_filterbank,
                     chord_voicing_strength=float(config.chord_voicing_strength),
+                    stereo_audio=stereo_segment,
                 )
 
             # 3-a-0. フルミックススロットの整合性を時間窓ごとに計測する。
@@ -1353,24 +1493,44 @@ def optimize_velocity_and_mix_by_render_compare(
                     else float(config.dynamics_compression)
                 )
 
+                unclipped_velocities: list[float] = []
                 for note_state in track_notes:
                     relative_error_db = within_track_note_errors_db[note_state.note_id] * compression
                     clamped_error = float(np.clip(relative_error_db, -config.max_step_error_db, config.max_step_error_db))
                     velocity_ratio = 10.0 ** (
                         float(config.velocity_damping) * clamped_error / float(config.velocity_curve_range_db)
                     )
+                    unclipped_velocity = note_state.velocity * velocity_ratio
+                    unclipped_velocities.append(unclipped_velocity)
                     note_state.velocity = float(
-                        np.clip(note_state.velocity * velocity_ratio, track_min_velocity, config.max_velocity)
+                        np.clip(unclipped_velocity, track_min_velocity, config.max_velocity)
                     )
 
                 _smooth_track_velocities(track_state, track_notes, config=config)
 
                 if config.optimize_volume_cc7 and len(track_notes) >= 3:
                     deficit_db = cc7_headroom_deficit_db[track_state.track_key]
+                    # ギターソロやサビのピークが Velocity 127 天井へ張り付いている場合、CC#7 に余裕があれば
+                    # トラック中央の目標 Velocity を少し下げつつ CC#7 を同 dB 引き上げてピークの余裕を確保する。
+                    peak_clip_db = 0.0
+                    if deficit_db <= 1e-3 and track_state.volume_cc7 < float(config.max_volume_cc7) - 1.0:
+                        upper_unclipped = float(np.percentile(unclipped_velocities, 95))
+                        if upper_unclipped > float(config.max_velocity) * 1.03:
+                            raw_clip_db = float(config.velocity_curve_range_db) * math.log10(
+                                upper_unclipped / float(config.max_velocity)
+                            )
+                            available_cc7_headroom_db = float(config.volume_cc7_curve_range_db) * math.log10(
+                                float(config.max_volume_cc7) / max(track_state.volume_cc7, 1.0)
+                            )
+                            peak_clip_db = min(raw_clip_db, available_cc7_headroom_db, 5.5)
+
+                    base_center = float(config.initial_velocity) * (
+                        10.0 ** ((deficit_db - peak_clip_db) / float(config.velocity_curve_range_db))
+                    )
                     target_center_velocity = float(
                         np.clip(
-                            float(config.initial_velocity) * (10.0 ** (deficit_db / float(config.velocity_curve_range_db))),
-                            track_min_velocity,
+                            base_center,
+                            max(track_min_velocity, 84),
                             min(122, int(config.max_velocity)),
                         )
                     )
@@ -1382,6 +1542,21 @@ def optimize_velocity_and_mix_by_render_compare(
                             note_state.velocity = float(
                                 np.clip(note_state.velocity * blended_ratio, track_min_velocity, config.max_velocity)
                             )
+                        # Velocity を下げた実適用 dB 分だけ CC#7 を同量引き上げ、トラック全体の基準ラウドネスを厳密に保つ。
+                        if peak_clip_db > 0.2:
+                            new_median_velocity = float(np.median([item.velocity for item in track_notes]))
+                            applied_velocity_drop_db = float(config.velocity_curve_range_db) * math.log10(
+                                max(median_velocity, 1.0) / max(new_median_velocity, 1.0)
+                            )
+                            if applied_velocity_drop_db > 0.0:
+                                track_state.volume_cc7 = float(
+                                    np.clip(
+                                        track_state.volume_cc7
+                                        * (10.0 ** (applied_velocity_drop_db / float(config.volume_cc7_curve_range_db))),
+                                        config.min_volume_cc7,
+                                        config.max_volume_cc7,
+                                    )
+                                )
 
     # 4. 最適化結果を PrettyMIDI オブジェクトへ書き戻す。
     track_reports: list[dict[str, Any]] = []
@@ -1486,6 +1661,7 @@ def optimize_velocity_and_mix_by_render_compare(
         "stems": stems_with_notes,
         "note_count": int(len(notes)),
         "track_count": int(len(track_reports)),
+        "stereo_splits": stereo_split_reports,
         "iterations": iteration_history,
         "tracks": track_reports,
         "output_midi_path": merged_output_resolved,

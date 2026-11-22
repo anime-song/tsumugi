@@ -33,8 +33,9 @@ def _render_gm_curve_midi(
 
     program_by_channel: dict[int, int] = {}
     cc7_by_channel: dict[int, int] = {}
-    active_notes: dict[tuple[int, int], tuple[float, int, int, int]] = {}
-    events: list[tuple[float, float, int, int, int, int, bool]] = []
+    cc10_by_channel: dict[int, int] = {}
+    active_notes: dict[tuple[int, int], tuple[float, int, int, int, int]] = {}
+    events: list[tuple[float, float, int, int, int, int, int, bool]] = []
 
     current_seconds = 0.0
     for message in mido.merge_tracks(midi_file.tracks):
@@ -46,6 +47,8 @@ def _render_gm_curve_midi(
             program_by_channel[int(message.channel)] = int(message.program)
         elif message.type == "control_change" and int(message.control) == 7:
             cc7_by_channel[int(message.channel)] = int(message.value)
+        elif message.type == "control_change" and int(message.control) == 10:
+            cc10_by_channel[int(message.channel)] = int(message.value)
         elif message.type == "note_on" and int(message.velocity) > 0:
             channel = int(message.channel)
             pitch = int(message.note)
@@ -54,19 +57,21 @@ def _render_gm_curve_midi(
                 int(message.velocity),
                 program_by_channel.get(channel, 0),
                 cc7_by_channel.get(channel, 100),
+                cc10_by_channel.get(channel, 64),
             )
         elif message.type == "note_off" or (message.type == "note_on" and int(message.velocity) == 0):
             channel = int(message.channel)
             pitch = int(message.note)
             started = active_notes.pop((channel, pitch), None)
             if started is not None:
-                events.append((started[0], current_seconds, pitch, started[1], started[2], started[3], channel == 9))
+                events.append((started[0], current_seconds, pitch, started[1], started[2], started[3], started[4], channel == 9))
 
     total_samples = max(1, int(round((current_seconds + 0.1) * sample_rate)))
-    mono = np.zeros(total_samples, dtype=np.float32)
+    left = np.zeros(total_samples, dtype=np.float32)
+    right = np.zeros(total_samples, dtype=np.float32)
     gains = program_gain_db or {}
 
-    for start_seconds, end_seconds, pitch, velocity, program, volume_cc7, is_drum in events:
+    for start_seconds, end_seconds, pitch, velocity, program, volume_cc7, pan_cc10, is_drum in events:
         start_sample = max(0, int(round(start_seconds * sample_rate)))
         end_sample = min(total_samples, max(start_sample + 1, int(round(end_seconds * sample_rate))))
         length = end_sample - start_sample
@@ -92,9 +97,12 @@ def _render_gm_curve_midi(
             if fundamental * 2.0 < sample_rate * 0.48:
                 signal += 0.5 * np.sin(2.0 * np.pi * fundamental * 2.0 * time)
             signal *= np.exp(-2.0 * time)
-        mono[start_sample:end_sample] += (amplitude * signal).astype(np.float32)
+        theta = (float(pan_cc10) / 127.0) * (np.pi * 0.5)
+        rendered = (amplitude * signal).astype(np.float32)
+        left[start_sample:end_sample] += rendered * float(np.cos(theta))
+        right[start_sample:end_sample] += rendered * float(np.sin(theta))
 
-    stereo = np.column_stack((mono, mono))
+    stereo = np.column_stack((left, right))
     sf.write(str(wav_path), stereo, sample_rate, subtype="PCM_16")
 
 
@@ -263,3 +271,74 @@ def test_velocity_cli_parses_render_compare_flags(monkeypatch) -> None:
     assert args.soundfont == Path("gm.sf2")
     assert args.fluidsynth_executable == Path("fluidsynth.exe")
     assert args.render_compare_iterations == 4
+
+
+def test_render_compare_velocity_splits_double_guitar_and_boosts_center_solo(tmp_path: Path) -> None:
+    sample_rate = 8_000
+    # 左静かバッキング (CC#7=65, pan=18), 右静かバッキング (CC#7=65, pan=110),
+    # 中央大音量ソロ (CC#7=120, pan=64) の正解 3 トラックからステレオ目標 WAV を合成する。
+    true_guitar = pretty_midi.PrettyMIDI()
+    left_inst = pretty_midi.Instrument(program=29, name="Left")
+    left_inst.control_changes = [
+        pretty_midi.ControlChange(number=7, value=65, time=0.0),
+        pretty_midi.ControlChange(number=10, value=18, time=0.0),
+    ]
+    center_inst = pretty_midi.Instrument(program=29, name="Center")
+    center_inst.control_changes = [
+        pretty_midi.ControlChange(number=7, value=120, time=0.0),
+        pretty_midi.ControlChange(number=10, value=64, time=0.0),
+    ]
+    right_inst = pretty_midi.Instrument(program=29, name="Right")
+    right_inst.control_changes = [
+        pretty_midi.ControlChange(number=7, value=65, time=0.0),
+        pretty_midi.ControlChange(number=10, value=110, time=0.0),
+    ]
+
+    flat_guitar = pretty_midi.PrettyMIDI()
+    merged_flat = pretty_midi.Instrument(program=29, name="Overdriven Guitar")
+    for index in range(54):
+        start = 0.1 + index * 0.24
+        end = start + 0.16
+        if index < 48:
+            left_inst.notes.append(pretty_midi.Note(velocity=100, pitch=55, start=start, end=end))
+            merged_flat.notes.append(pretty_midi.Note(velocity=90, pitch=55, start=start, end=end))
+        center_inst.notes.append(pretty_midi.Note(velocity=110, pitch=74, start=start + 0.03, end=end + 0.03))
+        merged_flat.notes.append(pretty_midi.Note(velocity=90, pitch=74, start=start + 0.03, end=end + 0.03))
+        right_inst.notes.append(pretty_midi.Note(velocity=100, pitch=60, start=start + 0.06, end=end + 0.06))
+        merged_flat.notes.append(pretty_midi.Note(velocity=90, pitch=60, start=start + 0.06, end=end + 0.06))
+
+    true_guitar.instruments = [left_inst, center_inst, right_inst]
+    flat_guitar.instruments = [merged_flat]
+    true_midi_path = tmp_path / "guitar_true.mid"
+    flat_midi_path = tmp_path / "guitar_flat.mid"
+    target_wav_path = tmp_path / "guitar.wav"
+    true_guitar.write(str(true_midi_path))
+    flat_guitar.write(str(flat_midi_path))
+    _render_gm_curve_midi(true_midi_path, target_wav_path, sample_rate)
+
+    out_midi_path = tmp_path / "guitar_opt.mid"
+    report = optimize_velocity_and_mix_by_render_compare(
+        stem_midis={"guitar": flat_midi_path},
+        stem_audios={"guitar": target_wav_path},
+        config=RenderCompareVelocityConfig(
+            soundfont_path=tmp_path / "dummy.sf2",
+            sample_rate=sample_rate,
+            num_iterations=3,
+        ),
+        output_midi_path=out_midi_path,
+        packed_midi_renderer=lambda midi_file, wav_file, rate: _render_gm_curve_midi(midi_file, wav_file, rate),
+    )
+
+    assert len(report["stereo_splits"]) == 1
+    out_pm = pretty_midi.PrettyMIDI(str(out_midi_path))
+    by_name = {inst.name: inst for inst in out_pm.instruments}
+    assert set(by_name) == {"Overdriven Guitar (L)", "Overdriven Guitar (C)", "Overdriven Guitar (R)"}
+    cc7 = {name: next(cc.value for cc in inst.control_changes if cc.number == 7) for name, inst in by_name.items()}
+    cc10 = {name: next(cc.value for cc in inst.control_changes if cc.number == 10) for name, inst in by_name.items()}
+    assert cc10["Overdriven Guitar (L)"] < 40
+    assert 54 <= cc10["Overdriven Guitar (C)"] <= 74
+    assert cc10["Overdriven Guitar (R)"] > 90
+    # 中央ギターソロ (C) の CC#7 が左右の静かなバッキング (L)/(R) より明確に大きくなること。
+    assert cc7["Overdriven Guitar (C)"] > cc7["Overdriven Guitar (L)"] + 15
+    assert cc7["Overdriven Guitar (C)"] > cc7["Overdriven Guitar (R)"] + 15
+

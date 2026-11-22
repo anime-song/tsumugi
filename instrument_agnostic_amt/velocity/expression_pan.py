@@ -441,6 +441,378 @@ def _extract_track_expression_events(
     )
 
 
+def split_stereo_pan_tracks_in_stem_midi(
+    midi_object: pretty_midi.PrettyMIDI,
+    stereo_audio: np.ndarray,
+    *,
+    stem_name: str,
+    config: ExpressionPanConfig | None = None,
+    max_extra_tracks: int = 4,
+    min_notes_for_split: int = 80,
+    left_pan_upper: int = 48,
+    right_pan_lower: int = 80,
+    min_side_notes: int = 40,
+    min_side_ratio: float = 0.12,
+    min_outer_ratio: float = 0.45,
+    min_side_pan_gap: float = 44.0,
+    min_center_notes: int = 45,
+    min_center_ratio: float = 0.035,
+    min_center_coherence: float = 0.48,
+) -> list[dict[str, Any]]:
+    """左右に明確に振り分けられたダブルトラック（ダブルギター＋中央ソロ等）を (L)/(C)/(R) サブトラックへ自動分割する。
+
+    1 台のピアノやストリングスの自然なステレオ広がり（中央集中・左右パン差が小さい）は分割せず、
+    ハード L/R パン振りされた複数楽器だけを MIDI 16ch 予算 (max_extra_tracks) の範囲内で優先分割する。
+    さらに左右チャンネルの複素位相コヒーレンス Re(L·R*) / (|L|^2 + |R|^2) と旋律・和音グラフ上の
+    ラベル伝播を用いることで、(1) ダブルトラックの L+R 同時和音が (C) へ誤分類される問題と、
+    (2) 1 フレーズ内でノートごとに L/C/R がふらつく不安定さの両方を防ぐ。
+    """
+    effective_config = config or ExpressionPanConfig()
+    normalized_stem = str(stem_name).lower()
+    # ボーカル・ベース・ドラムに加え、1 台の鍵盤が低音(L)〜高音(R)へ連続配置されるピアノは
+    # 3 トラック分割すると音域間で不自然な CC#7 段差を生むため分割対象外とする。
+    if (
+        any(token in normalized_stem for token in (*effective_config.center_locked_stems, "piano"))
+        or max_extra_tracks <= 0
+    ):
+        return []
+
+    active_instruments = [
+        (index, instrument)
+        for index, instrument in enumerate(midi_object.instruments)
+        if not instrument.is_drum
+        and int(instrument.program) not in range(0, 6)
+        and len(instrument.notes) >= int(min_notes_for_split)
+    ]
+    if not active_instruments:
+        return []
+
+    sample_rate = int(effective_config.sample_rate)
+    n_fft = min(2048, max(128, 2 ** int(round(math.log2(max(128.0, float(sample_rate) * 0.09))))))
+    hop_length = max(32, min(256, n_fft // 8))
+    frames_per_second = float(sample_rate) / float(hop_length)
+
+    # 低音バッキングの 3 次倍音が高音ソロの基本波と重なってパンが引っ張られるのを防ぎつつ、
+    # 歪みギター等で基本波が弱いケースにも対応するため基本波 (1.0) + 第 2 倍音 (0.45) の狭帯域フィルタバンクを使う。
+    num_bins = n_fft // 2 + 1
+    frequencies = np.linspace(0.0, float(sample_rate) * 0.5, num_bins, dtype=np.float64)
+    bin_spacing = float(sample_rate) / float(n_fft)
+    pitch_min = 21
+    pitch_max = 108
+    harmonic_filterbank = np.zeros((pitch_max - pitch_min + 1, num_bins), dtype=np.float32)
+    for pitch in range(pitch_min, pitch_max + 1):
+        fundamental_hz = 440.0 * (2.0 ** ((float(pitch) - 69.0) / 12.0))
+        row = np.zeros(num_bins, dtype=np.float64)
+        for harmonic_order, harmonic_weight in ((1, 1.0), (2, 0.45)):
+            center_hz = fundamental_hz * float(harmonic_order)
+            if center_hz >= float(sample_rate) * 0.48:
+                continue
+            sigma_hz = max(center_hz * 0.025, bin_spacing * 0.9)
+            row += harmonic_weight * np.exp(-0.5 * np.square((frequencies - center_hz) / sigma_hz))
+        row_sum = float(row.sum())
+        if row_sum > 1e-8:
+            harmonic_filterbank[pitch - pitch_min] = (row / row_sum).astype(np.float32)
+
+    # 左右パワーに加え、複素クロススペクトル実部 Re(L·conj(R)) から L/R 位相コヒーレンスを算出する。
+    # 中央モノラルソロは L≒R で高コヒーレンス (+0.6〜+1.0)、左右ダブルトラックは異テイクで低コヒーレンス (〜0.2) になる。
+    stereo_float = np.asarray(stereo_audio, dtype=np.float32)
+    if stereo_float.ndim != 2 or int(stereo_float.shape[0]) != 2:
+        raise ValueError(f"Expected stereo audio with shape [2, T], got {stereo_float.shape}")
+    if int(stereo_float.shape[1]) < n_fft:
+        stereo_float = np.pad(stereo_float, ((0, 0), (0, n_fft - int(stereo_float.shape[1]))))
+    window = torch.hann_window(n_fft, dtype=torch.float32)
+    window_energy = float(window.square().sum().item())
+    stereo_spectrum = torch.stft(
+        torch.from_numpy(stereo_float),
+        n_fft=n_fft,
+        hop_length=hop_length,
+        win_length=n_fft,
+        window=window,
+        center=True,
+        return_complex=True,
+    )
+    left_real = stereo_spectrum[0].real.numpy()
+    left_imag = stereo_spectrum[0].imag.numpy()
+    right_real = stereo_spectrum[1].real.numpy()
+    right_imag = stereo_spectrum[1].imag.numpy()
+    left_power = (left_real * left_real + left_imag * left_imag) / max(window_energy, 1e-8)
+    right_power = (right_real * right_real + right_imag * right_imag) / max(window_energy, 1e-8)
+    cross_real_power = (left_real * right_real + left_imag * right_imag) / max(window_energy, 1e-8)
+
+    left_pitch = harmonic_filterbank @ left_power
+    right_pitch = harmonic_filterbank @ right_power
+    cross_pitch = harmonic_filterbank @ cross_real_power
+    num_frames = int(left_pitch.shape[1])
+
+    def _decode_zone_labels(
+        unary_scores: np.ndarray,
+        neighbor_edges: list[list[tuple[int, float]]],
+        *,
+        allow_center: bool,
+    ) -> np.ndarray:
+        """旋律・和音グラフ上の平均場ラベル伝播（8 反復）で時間的に安定したゾーン列 {0:L, 1:C, 2:R} を求める。"""
+        effective_unary = unary_scores.copy()
+        if not allow_center:
+            effective_unary[:, 1] = -1e6
+        beliefs = effective_unary.copy()
+        for _ in range(8):
+            shifted = beliefs - beliefs.max(axis=1, keepdims=True)
+            probabilities = np.exp(shifted * 1.5)
+            probabilities /= np.maximum(probabilities.sum(axis=1, keepdims=True), 1e-12)
+            next_beliefs = effective_unary.copy()
+            for node_index in range(effective_unary.shape[0]):
+                accumulated = np.zeros(3, dtype=np.float64)
+                for neighbor_index, edge_weight in neighbor_edges[node_index]:
+                    accumulated += edge_weight * probabilities[neighbor_index]
+                next_beliefs[node_index] = effective_unary[node_index] + 0.85 * accumulated
+            if not allow_center:
+                next_beliefs[:, 1] = -1e6
+            beliefs = next_beliefs
+        return beliefs.argmax(axis=1)
+
+    # 1. 各トラックのノート別パン・位相コヒーレンスを計測し、グラフ平滑化で安定した L/C/R 分離候補を作る。
+    split_plans: list[
+        tuple[float, int, np.ndarray, np.ndarray, list[list[tuple[int, float]]], list[pretty_midi.Note], bool, int, int]
+    ] = []
+    for instrument_index, instrument in active_instruments:
+        ordered_notes = sorted(instrument.notes, key=lambda note: (note.start, note.pitch, note.end))
+        note_count = len(ordered_notes)
+        raw_pans = np.empty(note_count, dtype=np.float64)
+        raw_coherences = np.empty(note_count, dtype=np.float64)
+        for position, note in enumerate(ordered_notes):
+            start_frame = max(0, min(num_frames - 1, int(math.floor(float(note.start) * frames_per_second))))
+            end_frame = min(num_frames, max(start_frame + 1, int(math.ceil(float(note.end) * frames_per_second))))
+            clamped_pitch = max(pitch_min, min(pitch_max, int(note.pitch)))
+            pitch_row = clamped_pitch - pitch_min
+            left_energy = float(np.mean(left_pitch[pitch_row, start_frame:end_frame]))
+            right_energy = float(np.mean(right_pitch[pitch_row, start_frame:end_frame]))
+            cross_energy = float(np.mean(cross_pitch[pitch_row, start_frame:end_frame]))
+            raw_pans[position] = float(
+                _energy_pair_to_pan_cc10(
+                    left_energy,
+                    right_energy,
+                    min_pan=0,
+                    max_pan=127,
+                )
+            )
+            raw_coherences[position] = float((2.0 * cross_energy) / max(left_energy + right_energy, 1e-12))
+
+        starts = np.asarray([float(note.start) for note in ordered_notes], dtype=np.float64)
+        pitches = np.asarray([int(note.pitch) for note in ordered_notes], dtype=np.int32)
+
+        # ノート単位の単項スコア: L/R は振幅パン、C は中央パンかつ高位相コヒーレンスを必須条件にする。
+        unary_scores = np.zeros((note_count, 3), dtype=np.float64)
+        is_clear_center = np.zeros(note_count, dtype=np.bool_)
+        is_clear_side = np.zeros(note_count, dtype=np.bool_)
+        for position in range(note_count):
+            pan_value = raw_pans[position]
+            coherence_value = raw_coherences[position]
+            normalized_side = (pan_value - 64.0) / 36.0
+            unary_scores[position, 0] = -normalized_side
+            unary_scores[position, 2] = normalized_side
+
+            center_pan_fit = max(0.0, 1.0 - abs(pan_value - 64.0) / 26.0)
+            if coherence_value >= float(min_center_coherence) and center_pan_fit > 0.0:
+                unary_scores[position, 1] = 1.75 * center_pan_fit * min(
+                    1.6,
+                    (coherence_value - 0.32) / 0.35,
+                )
+                if coherence_value >= 0.65 and center_pan_fit >= 0.45:
+                    is_clear_center[position] = True
+            else:
+                unary_scores[position, 1] = -1.35
+
+            if (pan_value <= 34.0 or pan_value >= 94.0) and coherence_value < float(min_center_coherence):
+                is_clear_side[position] = True
+
+        # 旋律連続（同音高・近接音高の連続フレーズ）および同一和音（35ms 以内）に結合エッジを張る。
+        # 明確な中央ソロとハードサイド間は常に切り離し、同時和音ではハード逆サイド同士を結合しない。
+        # 一方で時間的に連続する旋律フレーズ (delta_seconds > 0.035) は単発のパン誤推定を吸収するため結合する。
+        neighbor_edges: list[list[tuple[int, float]]] = [[] for _ in range(note_count)]
+        for first_index in range(note_count):
+            for second_index in range(first_index + 1, min(note_count, first_index + 25)):
+                delta_seconds = starts[second_index] - starts[first_index]
+                if delta_seconds > 0.65:
+                    break
+                if (is_clear_center[first_index] and is_clear_side[second_index]) or (
+                    is_clear_side[first_index] and is_clear_center[second_index]
+                ):
+                    continue
+
+                pitch_gap = abs(int(pitches[second_index]) - int(pitches[first_index]))
+                if delta_seconds <= 0.035:
+                    if (raw_pans[first_index] <= 34.0 and raw_pans[second_index] >= 94.0) or (
+                        raw_pans[second_index] <= 34.0 and raw_pans[first_index] >= 94.0
+                    ):
+                        continue
+                    edge_weight = 0.70 if pitch_gap <= 12 else 0.25
+                else:
+                    if pitch_gap == 0:
+                        edge_weight = 2.2 * math.exp(-delta_seconds / 0.45)
+                    elif pitch_gap <= 5:
+                        edge_weight = 1.5 * math.exp(-delta_seconds / 0.35) * math.exp(-float(pitch_gap) / 5.0)
+                    elif pitch_gap <= 9 and delta_seconds <= 0.25:
+                        edge_weight = 0.60 * math.exp(-delta_seconds / 0.25)
+                    else:
+                        continue
+                neighbor_edges[first_index].append((second_index, edge_weight))
+                neighbor_edges[second_index].append((first_index, edge_weight))
+
+        decoded_labels = _decode_zone_labels(unary_scores, neighbor_edges, allow_center=True)
+        center_mask = decoded_labels == 1
+        center_count = int(center_mask.sum())
+        include_center = (
+            center_count >= int(min_center_notes)
+            and (float(center_count) / float(note_count)) >= float(min_center_ratio)
+        )
+        if not include_center:
+            decoded_labels = _decode_zone_labels(unary_scores, neighbor_edges, allow_center=False)
+
+        left_mask = decoded_labels == 0
+        right_mask = decoded_labels == 2
+        left_count = int(left_mask.sum())
+        right_count = int(right_mask.sum())
+        if min(left_count, right_count) < int(min_side_notes):
+            continue
+        if (float(min(left_count, right_count)) / float(note_count)) < float(min_side_ratio):
+            continue
+        if (float(left_count + right_count) / float(note_count)) < float(min_outer_ratio):
+            continue
+
+        # 元パン分布でも明確に左右へ分かれているか確認し、中央寄りの単一楽器の誤分割を防ぐ。
+        raw_outer_count = int(((raw_pans <= float(left_pan_upper)) | (raw_pans >= float(right_pan_lower))).sum())
+        if (float(raw_outer_count) / float(note_count)) < float(min_outer_ratio) * 0.85:
+            continue
+
+        left_median = int(np.clip(round(float(np.median(raw_pans[left_mask]))), effective_config.min_pan, 54))
+        right_median = int(np.clip(round(float(np.median(raw_pans[right_mask]))), 74, effective_config.max_pan))
+        pan_gap = float(right_median - left_median)
+        if pan_gap < float(min_side_pan_gap):
+            continue
+
+        priority = float(note_count) * pan_gap
+        split_plans.append(
+            (
+                priority,
+                instrument_index,
+                raw_pans,
+                unary_scores,
+                neighbor_edges,
+                ordered_notes,
+                include_center,
+                left_median,
+                right_median,
+            )
+        )
+
+    if not split_plans:
+        return []
+
+    # 2. 優先度（ノート数 × パン幅）順に MIDI 16ch 予算の範囲内でサブトラックへ分割する。
+    split_plans.sort(key=lambda item: -item[0])
+    remaining_budget = int(max_extra_tracks)
+    replacements: dict[int, list[pretty_midi.Instrument]] = {}
+    split_reports: list[dict[str, Any]] = []
+
+    for (
+        _priority,
+        instrument_index,
+        raw_pans,
+        unary_scores,
+        neighbor_edges,
+        ordered_notes,
+        include_center,
+        left_median,
+        right_median,
+    ) in split_plans:
+        needed_extra = 2 if include_center else 1
+        if needed_extra > remaining_budget:
+            if remaining_budget >= 1:
+                include_center = False
+                needed_extra = 1
+            else:
+                break
+
+        final_labels = _decode_zone_labels(unary_scores, neighbor_edges, allow_center=include_center)
+        source = midi_object.instruments[instrument_index]
+        base_name = str(source.name)
+        left_notes: list[pretty_midi.Note] = []
+        center_notes: list[pretty_midi.Note] = []
+        right_notes: list[pretty_midi.Note] = []
+
+        for note, label_value in zip(ordered_notes, final_labels.tolist()):
+            if label_value == 0:
+                left_notes.append(note)
+            elif label_value == 1 and include_center:
+                center_notes.append(note)
+            else:
+                right_notes.append(note)
+
+        # 万が一どこかのバケットが空になったら安全のため分割を見送る。
+        buckets: list[tuple[str, int, list[pretty_midi.Note]]] = [
+            ("L", left_median, left_notes),
+        ]
+        if include_center and center_notes:
+            center_pans = [
+                pan_value
+                for pan_value, label_value in zip(raw_pans.tolist(), final_labels.tolist())
+                if label_value == 1
+            ]
+            center_median = int(np.clip(round(float(np.median(center_pans))), 54, 74))
+            buckets.append(("C", center_median, center_notes))
+        buckets.append(("R", right_median, right_notes))
+        if any(not bucket_notes for _label, _pan, bucket_notes in buckets):
+            continue
+
+        new_subtracks: list[pretty_midi.Instrument] = []
+        for label, pan_value, bucket_notes in buckets:
+            subtrack = pretty_midi.Instrument(
+                program=int(source.program),
+                is_drum=False,
+                name=f"{base_name} ({label})",
+            )
+            subtrack.notes = bucket_notes
+            subtrack.control_changes = [
+                pretty_midi.ControlChange(number=int(control.number), value=int(control.value), time=float(control.time))
+                for control in source.control_changes
+                if int(control.number) != 10
+            ]
+            subtrack.control_changes.append(pretty_midi.ControlChange(number=10, value=int(pan_value), time=0.0))
+            subtrack.control_changes.sort(key=lambda control: (control.time, control.number))
+            new_subtracks.append(subtrack)
+
+        replacements[instrument_index] = new_subtracks
+        remaining_budget -= len(new_subtracks) - 1
+        split_reports.append(
+            {
+                "stem_name": stem_name,
+                "source_name": base_name,
+                "program_number": int(source.program),
+                "subtracks": [
+                    {
+                        "name": subtrack.name,
+                        "note_count": len(subtrack.notes),
+                        "pan": next(
+                            control.value for control in subtrack.control_changes if control.number == 10
+                        ),
+                    }
+                    for subtrack in new_subtracks
+                ],
+            }
+        )
+
+    if replacements:
+        rebuilt_instruments: list[pretty_midi.Instrument] = []
+        for index, instrument in enumerate(midi_object.instruments):
+            if index in replacements:
+                rebuilt_instruments.extend(replacements[index])
+            else:
+                rebuilt_instruments.append(instrument)
+        midi_object.instruments = rebuilt_instruments
+
+    return split_reports
+
+
 def apply_pan_and_expression_to_stem_midi(
     midi_object: pretty_midi.PrettyMIDI,
     stereo_audio: np.ndarray,
@@ -488,17 +860,30 @@ def apply_pan_and_expression_to_stem_midi(
         }
 
         if effective_config.enable_pan_cc10:
-            pan_events, pan_info = _extract_track_pan_events(
-                instrument,
-                stem_name=stem_name,
-                track_count_in_stem=track_count,
-                left_broadband=left_broadband,
-                right_broadband=right_broadband,
-                left_pitch=left_pitch,
-                right_pitch=right_pitch,
-                frames_per_second=frames_per_second,
-                config=effective_config,
-            )
+            # ステレオ分割済みのサブトラック (" (L)", " (C)", " (R)") は分割時に決定した固定パンをそのまま保つ。
+            is_stereo_split_subtrack = str(instrument.name).endswith((" (L)", " (C)", " (R)"))
+            existing_pan = next((int(control.value) for control in instrument.control_changes if int(control.number) == 10), None)
+            if is_stereo_split_subtrack and existing_pan is not None:
+                pan_events = [pretty_midi.ControlChange(number=10, value=int(existing_pan), time=0.0)]
+                pan_info = {
+                    "base_pan": int(existing_pan),
+                    "pan_events": 1,
+                    "pan_min": int(existing_pan),
+                    "pan_max": int(existing_pan),
+                    "center_locked": False,
+                }
+            else:
+                pan_events, pan_info = _extract_track_pan_events(
+                    instrument,
+                    stem_name=stem_name,
+                    track_count_in_stem=track_count,
+                    left_broadband=left_broadband,
+                    right_broadband=right_broadband,
+                    left_pitch=left_pitch,
+                    right_pitch=right_pitch,
+                    frames_per_second=frames_per_second,
+                    config=effective_config,
+                )
             preserved_controls.extend(pan_events)
             track_report.update(pan_info)
 

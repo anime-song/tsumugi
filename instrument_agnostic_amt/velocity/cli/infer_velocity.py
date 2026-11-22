@@ -847,6 +847,11 @@ def parse_args() -> argparse.Namespace:
         help="Disable stereo CC#10 pan extraction in Render & Compare mode",
     )
     parser.add_argument(
+        "--no-split-stereo-tracks",
+        action="store_true",
+        help="Disable automatic stereo L/C/R subtrack splitting for double-tracked instruments",
+    )
+    parser.add_argument(
         "--optimize-expression",
         action="store_true",
         help="Opt in to experimental sustained-instrument CC#11 expression extraction in Render & Compare mode",
@@ -972,6 +977,7 @@ def main() -> None:
                     num_iterations=int(args.render_compare_iterations),
                     optimize_volume_cc7=not args.no_optimize_cc7,
                     optimize_pan_cc10=not args.no_optimize_pan,
+                    split_stereo_pan_tracks=not args.no_split_stereo_tracks,
                     optimize_expression_cc11=bool(args.optimize_expression),
                     use_input_velocity_as_init=bool(args.use_input_velocity_init),
                     max_melodic_instruments=int(args.max_midi_melodic_instruments),

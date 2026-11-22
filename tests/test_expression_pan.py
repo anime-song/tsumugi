@@ -7,6 +7,7 @@ from instrument_agnostic_amt.velocity.expression_pan import (
     ExpressionPanConfig,
     apply_pan_and_expression_to_stem_midi,
     is_sustained_gm_program,
+    split_stereo_pan_tracks_in_stem_midi,
 )
 
 
@@ -144,3 +145,145 @@ def test_expression_extraction_tracks_strings_crescendo_and_resets_after_phrase(
     piano_cc11 = [cc for cc in piano_inst.control_changes if cc.number == 11]
     assert piano_reports[0]["expression_applied"] is False
     assert len(piano_cc11) == 1 and piano_cc11[0].value == 127
+
+
+def test_split_stereo_pan_tracks_splits_double_guitar_plus_solo_but_keeps_centered_piano() -> None:
+    sample_rate = 8_000
+    duration_seconds = 16.0
+    time = np.arange(int(duration_seconds * sample_rate), dtype=np.float32) / float(sample_rate)
+    left = np.zeros_like(time)
+    right = np.zeros_like(time)
+
+    # ハード左 (48 notes @ C4), 中央ソロ (54 notes @ A4), ハード右 (54 notes @ E4) を同時に鳴らすステレオ音声。
+    guitar_pm = pretty_midi.PrettyMIDI()
+    guitar_inst = pretty_midi.Instrument(program=29, name="Overdriven Guitar")
+
+    def _add_tone(pitch: int, start: float, end: float, left_gain: float, right_gain: float) -> None:
+        s = int(round(start * sample_rate))
+        e = min(time.size, int(round(end * sample_rate)))
+        t = time[s:e] - start
+        freq = 440.0 * (2.0 ** ((pitch - 69) / 12.0))
+        wave = 0.20 * np.sin(2.0 * np.pi * freq * t)
+        left[s:e] += (wave * left_gain).astype(np.float32)
+        right[s:e] += (wave * right_gain).astype(np.float32)
+        guitar_inst.notes.append(pretty_midi.Note(velocity=100, pitch=pitch, start=start, end=end))
+
+    for index in range(54):
+        start = 0.1 + index * 0.28
+        end = start + 0.18
+        if index < 48:
+            _add_tone(60, start, end, 0.95, 0.10)  # 左ギター
+        _add_tone(69, start + 0.04, end + 0.04, 0.70, 0.70)  # 中央ソロ
+        _add_tone(64, start + 0.08, end + 0.08, 0.10, 0.95)  # 右ギター
+
+    guitar_pm.instruments.append(guitar_inst)
+    stereo = np.stack((left, right), axis=0)
+
+    reports = split_stereo_pan_tracks_in_stem_midi(
+        guitar_pm,
+        stereo,
+        stem_name="guitar",
+        config=ExpressionPanConfig(sample_rate=sample_rate),
+        max_extra_tracks=3,
+    )
+    assert len(reports) == 1
+    names = [inst.name for inst in guitar_pm.instruments]
+    assert names == ["Overdriven Guitar (L)", "Overdriven Guitar (C)", "Overdriven Guitar (R)"]
+    pans = {inst.name: next(cc.value for cc in inst.control_changes if cc.number == 10) for inst in guitar_pm.instruments}
+    assert pans["Overdriven Guitar (L)"] < 40
+    assert 54 <= pans["Overdriven Guitar (C)"] <= 74
+    assert pans["Overdriven Guitar (R)"] > 90
+
+    # ワイドステレオ配置（低音=L, 高音=R）であってもピアノ (program=0) は 1 トラックのまま誤分割されないこと。
+    wide_piano_pm = pretty_midi.PrettyMIDI()
+    wide_piano_inst = pretty_midi.Instrument(program=0, name="Acoustic Grand Piano")
+    wide_piano_inst.notes = [
+        pretty_midi.Note(
+            velocity=note.velocity,
+            pitch=note.pitch,
+            start=note.start,
+            end=note.end,
+        )
+        for subtrack in guitar_pm.instruments
+        for note in subtrack.notes
+    ]
+    wide_piano_pm.instruments.append(wide_piano_inst)
+    assert (
+        split_stereo_pan_tracks_in_stem_midi(
+            wide_piano_pm,
+            stereo,
+            stem_name="other",
+            config=ExpressionPanConfig(sample_rate=sample_rate),
+        )
+        == []
+    )
+    assert len(wide_piano_pm.instruments) == 1
+
+    # 位相が無相関なダブルトラック（L と R が別位相で同時発音）は振幅比が中央付近でも (C) ソロへ誤分離されないこと。
+    uncorr_left = np.zeros_like(time)
+    uncorr_right = np.zeros_like(time)
+    uncorr_pm = pretty_midi.PrettyMIDI()
+    uncorr_inst = pretty_midi.Instrument(program=29, name="Overdriven Guitar")
+    for index in range(60):
+        start = 0.1 + index * 0.24
+        end = start + 0.16
+        s = int(round(start * sample_rate))
+        e = min(time.size, int(round(end * sample_rate)))
+        t = time[s:e] - start
+        if index < 20:
+            # ハード左フレーズ
+            wave = 0.20 * np.sin(2.0 * np.pi * 261.63 * t)
+            uncorr_left[s:e] += (wave * 0.95).astype(np.float32)
+            uncorr_right[s:e] += (wave * 0.10).astype(np.float32)
+            uncorr_inst.notes.append(pretty_midi.Note(velocity=100, pitch=60, start=start, end=end))
+        elif index < 40:
+            # ハード右フレーズ
+            wave = 0.20 * np.sin(2.0 * np.pi * 329.63 * t)
+            uncorr_left[s:e] += (wave * 0.10).astype(np.float32)
+            uncorr_right[s:e] += (wave * 0.95).astype(np.float32)
+            uncorr_inst.notes.append(pretty_midi.Note(velocity=100, pitch=64, start=start, end=end))
+        else:
+            # L と R が 90 度位相ズレ（無相関）で等振幅のダブルトラックユニゾン -> (C) は作らず (L)/(R) 2 トラックに収まる。
+            uncorr_left[s:e] += (0.20 * np.sin(2.0 * np.pi * 440.0 * t)).astype(np.float32)
+            uncorr_right[s:e] += (0.20 * np.cos(2.0 * np.pi * 440.0 * t)).astype(np.float32)
+            uncorr_inst.notes.append(pretty_midi.Note(velocity=100, pitch=69, start=start, end=end))
+    uncorr_pm.instruments.append(uncorr_inst)
+    uncorr_reports = split_stereo_pan_tracks_in_stem_midi(
+        uncorr_pm,
+        np.stack((uncorr_left, uncorr_right), axis=0),
+        stem_name="guitar",
+        config=ExpressionPanConfig(sample_rate=sample_rate),
+        min_notes_for_split=40,
+        min_side_notes=15,
+        min_center_notes=15,
+    )
+    assert len(uncorr_reports) == 1
+    assert [inst.name for inst in uncorr_pm.instruments] == [
+        "Overdriven Guitar (L)",
+        "Overdriven Guitar (R)",
+    ]
+
+    # 中央寄りの自然な広がりしかないシンセ／ピアノも 1 トラックのまま誤分割されないこと。
+    piano_left = np.zeros_like(time)
+    piano_right = np.zeros_like(time)
+    piano_pm = pretty_midi.PrettyMIDI()
+    piano_inst = pretty_midi.Instrument(program=0, name="Acoustic Grand Piano")
+    for index in range(100):
+        start = 0.1 + index * 0.15
+        end = start + 0.12
+        s = int(round(start * sample_rate))
+        e = min(time.size, int(round(end * sample_rate)))
+        wave = 0.20 * np.sin(2.0 * np.pi * 440.0 * (time[s:e] - start))
+        piano_left[s:e] += (wave * 0.75).astype(np.float32)
+        piano_right[s:e] += (wave * 0.65).astype(np.float32)
+        piano_inst.notes.append(pretty_midi.Note(velocity=100, pitch=69, start=start, end=end))
+    piano_pm.instruments.append(piano_inst)
+    piano_reports = split_stereo_pan_tracks_in_stem_midi(
+        piano_pm,
+        np.stack((piano_left, piano_right), axis=0),
+        stem_name="piano",
+        config=ExpressionPanConfig(sample_rate=sample_rate),
+    )
+    assert piano_reports == []
+    assert len(piano_pm.instruments) == 1
+
