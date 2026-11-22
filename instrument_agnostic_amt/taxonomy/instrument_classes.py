@@ -24,6 +24,9 @@ NUM_INSTRUMENT_CLASSES: int = 0
 _PROGRAM_TO_CLASS_ID: Dict[int, int] = {}
 _CLASS_NAME_TO_ID: Dict[str, int] = {}
 _CLASS_ID_TO_PROGRAM: Dict[int, int] = {}
+_CLASS_ID_TO_PROGRAMS: Dict[int, List[int]] = {}
+_PROGRAM_TO_NAME: Dict[int, str] = {}
+_PROGRAM_TO_SONG_COUNT: Dict[int, int] = {}
 _DRUM_CLASS_ID: Optional[int] = None
 
 
@@ -33,6 +36,9 @@ def _load_instrument_mappings() -> None:
     global _PROGRAM_TO_CLASS_ID
     global _CLASS_NAME_TO_ID
     global _CLASS_ID_TO_PROGRAM
+    global _CLASS_ID_TO_PROGRAMS
+    global _PROGRAM_TO_NAME
+    global _PROGRAM_TO_SONG_COUNT
     global _DRUM_CLASS_ID
 
     INSTRUMENT_CLASSES = []
@@ -40,6 +46,9 @@ def _load_instrument_mappings() -> None:
     _PROGRAM_TO_CLASS_ID = {}
     _CLASS_NAME_TO_ID = {}
     _CLASS_ID_TO_PROGRAM = {}
+    _CLASS_ID_TO_PROGRAMS = {}
+    _PROGRAM_TO_NAME = {}
+    _PROGRAM_TO_SONG_COUNT = {}
     _DRUM_CLASS_ID = None
 
     if not _MERGE_JSON_PATH.exists():
@@ -77,6 +86,15 @@ def _load_instrument_mappings() -> None:
             prog_num = int(prog_num)
             _PROGRAM_TO_CLASS_ID[prog_num] = class_id
             _CLASS_ID_TO_PROGRAM.setdefault(class_id, prog_num)
+            program_list = _CLASS_ID_TO_PROGRAMS.setdefault(class_id, [])
+            if prog_num not in program_list:
+                program_list.append(prog_num)
+            instrument_name = member.get("instrument_name")
+            if isinstance(instrument_name, str) and instrument_name.strip():
+                _PROGRAM_TO_NAME.setdefault(prog_num, instrument_name.strip())
+            song_group_count = member.get("song_group_count")
+            if song_group_count is not None:
+                _PROGRAM_TO_SONG_COUNT[prog_num] = max(0, int(song_group_count))
 
     # melody はGM programから自動判定するクラスではない。
     # prepare_dataset.py 側でトラック名を見て明示的にこのクラスへ割り当てる。
@@ -84,6 +102,7 @@ def _load_instrument_mappings() -> None:
         class_id = _CLASS_NAME_TO_ID.get(class_name)
         if class_id is not None:
             _CLASS_ID_TO_PROGRAM[class_id] = program_number
+            _CLASS_ID_TO_PROGRAMS.setdefault(class_id, [program_number])
 
 
 _load_instrument_mappings()
@@ -125,3 +144,33 @@ def get_program_number_from_class_id(class_id: int) -> int:
         return 0
 
     return _CLASS_ID_TO_PROGRAM.get(class_id, 0)
+
+
+def get_program_numbers_for_class_id(class_id: int) -> tuple[int, ...]:
+    """
+    クラスIDに属する全GM program numberをinstrument_merge.jsonの記載順で返す。
+    """
+    if class_id == _DRUM_CLASS_ID:
+        return ()
+
+    programs = _CLASS_ID_TO_PROGRAMS.get(int(class_id))
+    if programs:
+        return tuple(programs)
+    if int(class_id) in _CLASS_ID_TO_PROGRAM:
+        return (_CLASS_ID_TO_PROGRAM[int(class_id)],)
+    return ()
+
+
+def get_gm_program_name(program_number: int) -> str:
+    """
+    0-basedのGM program numberから標準楽器名を返す。
+    """
+    normalized_program = int(program_number)
+    return _PROGRAM_TO_NAME.get(normalized_program, f"GM Program {normalized_program}")
+
+
+def get_gm_program_frequency(program_number: int) -> int:
+    """
+    instrument_merge.json に記録された GM program ごとの出現曲数（事前分布用）を返す。
+    """
+    return int(_PROGRAM_TO_SONG_COUNT.get(int(program_number), 0))

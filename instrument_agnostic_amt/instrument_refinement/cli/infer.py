@@ -14,6 +14,7 @@ from pathlib import Path
 import torch
 
 from ..inference.refine import refine_midi_instruments
+from ..inference.render_compare import RenderCompareConfig
 
 
 HF_CHECKPOINT_BASE_URL = "https://huggingface.co/anime-song/instrument_agnostic_amt/resolve/main"
@@ -77,11 +78,52 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--top-k", type=int, default=3)
     parser.add_argument("--no-stem-mask", action="store_true")
     parser.add_argument("--disable-tqdm", action="store_true")
+    parser.add_argument(
+        "--soundfont",
+        type=Path,
+        default=None,
+        help="Optional SoundFont (.sf2) to enable Render & Compare GM 128 program selection.",
+    )
+    parser.add_argument(
+        "--fluidsynth-executable",
+        type=Path,
+        default=None,
+        help="Optional path to fluidsynth executable. Searches PATH when omitted.",
+    )
+    parser.add_argument(
+        "--render-compare-mode",
+        choices=("top_classes", "stem_all"),
+        default="top_classes",
+        help="Candidate expansion scope for Render & Compare.",
+    )
+    parser.add_argument("--render-compare-top-classes", type=int, default=5)
+    parser.add_argument("--render-compare-max-programs", type=int, default=24)
+    parser.add_argument("--render-compare-snippet-seconds", type=float, default=4.0)
+    parser.add_argument("--render-compare-max-snippets", type=int, default=2)
+    parser.add_argument("--render-compare-prior-weight", type=float, default=0.08)
+    parser.add_argument("--render-compare-disable-reverb", action="store_true")
+    parser.add_argument("--render-compare-disable-chorus", action="store_true")
     return parser.parse_args()
 
 
 def main() -> None:
     args = parse_args()
+    render_compare_config = (
+        RenderCompareConfig(
+            soundfont_path=args.soundfont,
+            fluidsynth_executable=args.fluidsynth_executable,
+            candidate_mode=args.render_compare_mode,
+            top_candidate_classes=args.render_compare_top_classes,
+            max_candidate_programs=args.render_compare_max_programs,
+            snippet_seconds=args.render_compare_snippet_seconds,
+            max_snippets_per_cluster=args.render_compare_max_snippets,
+            classifier_prior_weight=args.render_compare_prior_weight,
+            disable_reverb=args.render_compare_disable_reverb,
+            disable_chorus=args.render_compare_disable_chorus,
+        )
+        if args.soundfont is not None
+        else None
+    )
     report = refine_midi_instruments(
         args.audio,
         args.midi,
@@ -101,6 +143,7 @@ def main() -> None:
         top_k=args.top_k,
         use_stem_mask=not args.no_stem_mask,
         disable_tqdm=args.disable_tqdm,
+        render_compare_config=render_compare_config,
     )
     # レポート全文は長いので、標準出力には要点だけ出す（全文は --output-json へ）。
     summary = {
@@ -109,11 +152,35 @@ def main() -> None:
             "note_count",
             "window_count",
             "cluster_count",
+            "render_compare_enabled",
             "window_flip_count_before_smoothing",
             "window_flip_count_after_smoothing",
             "global_candidates",
         )
     }
+    if report.get("render_compare_enabled"):
+        summary["cluster_programs"] = [
+            {
+                "cluster_id": cluster["cluster_id"],
+                "note_count": cluster["note_count"],
+                "classifier_top_class": cluster["candidates"][0]["class_name"] if cluster["candidates"] else None,
+                "selected_program": cluster.get("selected_program"),
+                "selected_program_name": cluster.get("selected_program_name"),
+                "selected_class_name": cluster.get("selected_class_name"),
+                "top_render_compare": [
+                    {
+                        "program_number": candidate["program_number"],
+                        "program_name": candidate["program_name"],
+                        "total_distance": round(float(candidate["total_distance"]), 4),
+                        "embedding_distance": round(float(candidate["embedding_distance"]), 4),
+                        "spectral_distance": round(float(candidate["spectral_distance"]), 4),
+                        "envelope_distance": round(float(candidate["envelope_distance"]), 4),
+                    }
+                    for candidate in cluster.get("render_compare_candidates", [])[:3]
+                ],
+            }
+            for cluster in report["clusters"]
+        ]
     print(json.dumps(summary, ensure_ascii=False, indent=2))
 
 

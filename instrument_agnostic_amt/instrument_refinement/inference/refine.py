@@ -33,6 +33,7 @@ from ...runtime import (
 )
 from ...taxonomy.instrument_classes import (
     INSTRUMENT_CLASSES,
+    get_gm_program_name,
     get_instrument_class_id_by_name,
     get_program_number_from_class_id,
 )
@@ -48,6 +49,10 @@ from .aggregation import (
     cluster_note_embeddings,
     top_candidates,
     viterbi_smooth_classes,
+)
+from .render_compare import (
+    RenderCompareConfig,
+    select_gm_programs_by_render_compare,
 )
 
 
@@ -376,6 +381,7 @@ def _build_report(
     cluster_ids: np.ndarray,
     predicted_class_ids: np.ndarray,
     *,
+    predicted_program_numbers: np.ndarray | None = None,
     config: InstrumentRefinementConfig,
     stem_name: str | None,
     mode: str,
@@ -391,11 +397,29 @@ def _build_report(
     使わず、ノートの楽器決定には影響しない。
     """
     smoothed = viterbi_smooth_classes(scan.window_logits, switch_penalty=switch_penalty)
+    note_entries: list[dict[str, Any]] = []
+    for index in range(notes.note_count):
+        entry: dict[str, Any] = {
+            "note_index": index,
+            "start_seconds": float(notes.start_seconds[index]),
+            "end_seconds": float(notes.end_seconds[index]),
+            "pitch": int(notes.pitch[index]),
+            "cluster_id": int(cluster_ids[index]),
+            "class_id": int(predicted_class_ids[index]),
+            "class_name": INSTRUMENT_CLASSES[int(predicted_class_ids[index])],
+        }
+        if predicted_program_numbers is not None:
+            program_number = int(predicted_program_numbers[index])
+            entry["program_number"] = program_number
+            entry["program_name"] = get_gm_program_name(program_number)
+        note_entries.append(entry)
+
     return {
         "audio_path": str(audio_file),
         "midi_path": str(midi_file),
         "stem_name": stem_name,
         "mode": mode,
+        "render_compare_enabled": predicted_program_numbers is not None,
         "global_logit_weight": float(global_logit_weight),
         "note_count": notes.note_count,
         "window_count": len(scan.starts),
@@ -417,18 +441,7 @@ def _build_report(
             for start, note_count, class_id in zip(scan.starts, scan.window_note_counts, smoothed)
         ],
         "clusters": clusters,
-        "notes": [
-            {
-                "note_index": index,
-                "start_seconds": float(notes.start_seconds[index]),
-                "end_seconds": float(notes.end_seconds[index]),
-                "pitch": int(notes.pitch[index]),
-                "cluster_id": int(cluster_ids[index]),
-                "class_id": int(predicted_class_ids[index]),
-                "class_name": INSTRUMENT_CLASSES[int(predicted_class_ids[index])],
-            }
-            for index in range(notes.note_count)
-        ],
+        "notes": note_entries,
     }
 
 
@@ -438,36 +451,62 @@ def _rewrite_midi(
     *,
     table: RefinementNoteTable,
     predicted_class_ids: np.ndarray,
+    predicted_program_numbers: np.ndarray | None = None,
 ) -> None:
-    """元 MIDI を読み直し、ノートを予測クラスごとのトラックに割り振って保存する。
+    """元 MIDI を読み直し、ノートを予測楽器ごとのトラックに割り振って保存する。
 
     ノート自体（時刻・音高・velocity）は触らず、所属トラックの program と名前だけが
     変わる。1 つのトラックから複数の楽器が出た場合はトラックが分割される。
+    predicted_program_numbers が指定された場合は、クラス代表ではなく選定された具体的な
+    GM program 番号と標準 GM 名を書き込む。
     """
     midi = pretty_midi.PrettyMIDI(str(input_path))
+    use_explicit_programs = predicted_program_numbers is not None
     # ノート表は (トラック番号, トラック内のノート番号) を保持しているので、
     # それをキーに「このノートは何の楽器か」を引けるようにする。
-    assignments = {
-        (int(instrument_index), int(note_index)): int(class_id)
-        for instrument_index, note_index, class_id in zip(table.instrument_index, table.note_index, predicted_class_ids)
-    }
+    if use_explicit_programs:
+        assignments = {
+            (int(instrument_index), int(note_index)): (int(class_id), int(program_number))
+            for instrument_index, note_index, class_id, program_number in zip(
+                table.instrument_index,
+                table.note_index,
+                predicted_class_ids,
+                predicted_program_numbers,
+            )
+        }
+    else:
+        assignments = {
+            (int(instrument_index), int(note_index)): (
+                int(class_id),
+                int(get_program_number_from_class_id(int(class_id))),
+            )
+            for instrument_index, note_index, class_id in zip(
+                table.instrument_index,
+                table.note_index,
+                predicted_class_ids,
+            )
+        }
     rewritten: list[pretty_midi.Instrument] = []
+    fallback_class = get_instrument_class_id_by_name("piano")
+    fallback_pair = (fallback_class, int(get_program_number_from_class_id(fallback_class)))
     for instrument_index, instrument in enumerate(midi.instruments):
         # ドラムはこのモデルの対象外なのでそのまま残す。
         if instrument.is_drum or not instrument.notes:
             rewritten.append(instrument)
             continue
-        grouped: dict[int, list[pretty_midi.Note]] = {}
-        # ノート表に載らなかったノート（想定外だが念のため）は piano に寄せる。
-        fallback = get_instrument_class_id_by_name("piano")
+        grouped: dict[tuple[int, int], list[pretty_midi.Note]] = {}
         for note_index, note in enumerate(instrument.notes):
-            class_id = assignments.get((instrument_index, note_index), fallback)
-            grouped.setdefault(class_id, []).append(note)
-        for class_id, notes in sorted(grouped.items()):
+            assignment_key = assignments.get((instrument_index, note_index), fallback_pair)
+            grouped.setdefault(assignment_key, []).append(note)
+        for (class_id, program_number), notes in sorted(grouped.items()):
             refined = copy.deepcopy(instrument)
             refined.notes = notes
-            refined.program = get_program_number_from_class_id(class_id)
-            refined.name = INSTRUMENT_CLASSES[class_id]
+            refined.program = int(program_number)
+            refined.name = (
+                get_gm_program_name(program_number)
+                if use_explicit_programs
+                else INSTRUMENT_CLASSES[class_id]
+            )
             rewritten.append(refined)
     midi.instruments = rewritten
     output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -480,13 +519,20 @@ def _write_outputs(
     notes: RefinementNoteTable,
     predicted_class_ids: np.ndarray,
     *,
+    predicted_program_numbers: np.ndarray | None = None,
     output_midi_path: str | Path | None,
     output_json_path: str | Path | None,
 ) -> None:
     """指定されていれば書き出し、書いた先を report にも記録する。"""
     if output_midi_path is not None:
         destination = Path(output_midi_path)
-        _rewrite_midi(midi_file, destination, table=notes, predicted_class_ids=predicted_class_ids)
+        _rewrite_midi(
+            midi_file,
+            destination,
+            table=notes,
+            predicted_class_ids=predicted_class_ids,
+            predicted_program_numbers=predicted_program_numbers,
+        )
         report["output_midi_path"] = str(destination.resolve())
     if output_json_path is not None:
         json_path = Path(output_json_path)
@@ -522,6 +568,9 @@ def refine_midi_instruments(
     preloaded_waveform: torch.Tensor | None = None,
     amp: bool = False,
     amp_dtype: str | torch.dtype | None = None,
+    soundfont_path: str | Path | None = None,
+    fluidsynth_executable: str | Path | None = None,
+    render_compare_config: RenderCompareConfig | None = None,
 ) -> dict[str, Any]:
     """MIDI の楽器を、対応するステム音声から推論し直す。
 
@@ -540,6 +589,10 @@ def refine_midi_instruments(
         preloaded_waveform: config.sample_rateへresample済みのCPU float32ステレオ波形。
         amp: 窓ごとの backbone を autocast で走らせるか。CUDA / MPS でのみ有効。
         amp_dtype: "fp16" / "bf16" / torch.dtype。省略時はデバイス既定を使う。
+        soundfont_path: 指定すると FluidSynth で候補 GM プログラムをレンダリングし、
+            元ステムとの音色比較 (Render & Compare) で GM 128 プログラムを直接選定する。
+        fluidsynth_executable: FluidSynth 実行ファイルパス（未指定時は PATH から探索）。
+        render_compare_config: Render & Compare の詳細設定（指定時は soundfont_path より優先）。
 
     Returns:
         予測結果とデバッグ情報を含む dict。output_json_path を渡すと同じ内容を保存する。
@@ -563,6 +616,13 @@ def refine_midi_instruments(
         if isinstance(amp_dtype, torch.dtype)
         else resolve_amp_dtype(target_device, amp_dtype)
     )
+
+    effective_render_compare_config = render_compare_config
+    if effective_render_compare_config is None and soundfont_path is not None:
+        effective_render_compare_config = RenderCompareConfig(
+            soundfont_path=Path(soundfont_path),
+            fluidsynth_executable=Path(fluidsynth_executable) if fluidsynth_executable is not None else None,
+        )
 
     # 1. モデルを用意する。ステムごとに呼ばれる用途では読み込み済みモデルを受け取る。
     model, config = _resolve_model(checkpoint_path, preloaded_model, preloaded_config, device=target_device)
@@ -608,7 +668,7 @@ def refine_midi_instruments(
             min_cluster_notes=min_cluster_notes,
         )
 
-    # 5. クラスタごとに楽器を決める。
+    # 5. クラスタごとに楽器クラスを決める。
     predicted_class_ids, clusters = _cluster_reports(
         notes,
         scan,
@@ -617,6 +677,32 @@ def refine_midi_instruments(
         global_logit_weight=global_logit_weight,
         top_k=top_k,
     )
+
+    # 5.5 SoundFont 指定時は Render & Compare で具体的な GM 128 プログラムを直接選定する。
+    predicted_program_numbers: np.ndarray | None = None
+    if effective_render_compare_config is not None and notes.note_count > 0:
+        (
+            predicted_class_ids,
+            predicted_program_numbers,
+            clusters,
+        ) = select_gm_programs_by_render_compare(
+            model=model,
+            model_config=config,
+            waveform=waveform,
+            notes=notes,
+            cluster_ids=cluster_ids,
+            note_logits=scan.note_logits,
+            note_embeddings=scan.note_embeddings,
+            global_logits=scan.global_logits,
+            clusters=clusters,
+            allowed_class_ids=allowed,
+            global_logit_weight=global_logit_weight,
+            stem_name=stem_name,
+            device=target_device,
+            amp_enabled=amp_enabled,
+            amp_dtype=resolved_amp_dtype,
+            render_compare_config=effective_render_compare_config,
+        )
 
     # 6. 結果をまとめる。
     report = _build_report(
@@ -627,6 +713,7 @@ def refine_midi_instruments(
         clusters,
         cluster_ids,
         predicted_class_ids,
+        predicted_program_numbers=predicted_program_numbers,
         config=config,
         stem_name=stem_name,
         mode=mode,
@@ -642,6 +729,7 @@ def refine_midi_instruments(
         midi_file,
         notes,
         predicted_class_ids,
+        predicted_program_numbers=predicted_program_numbers,
         output_midi_path=output_midi_path,
         output_json_path=output_json_path,
     )

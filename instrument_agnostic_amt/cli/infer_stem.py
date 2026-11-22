@@ -33,6 +33,9 @@ from instrument_agnostic_amt.instrument_refinement.cli.infer import (
 from instrument_agnostic_amt.instrument_refinement.inference.refine import (
     refine_midi_instruments,
 )
+from instrument_agnostic_amt.instrument_refinement.inference.render_compare import (
+    RenderCompareConfig,
+)
 from instrument_agnostic_amt.velocity.cli.infer_velocity import (
     ensure_velocity_checkpoint,
     load_velocity_model,
@@ -550,6 +553,9 @@ def refine_stem_instrument_midis(
     waveform_loader: _WaveformLoader | None = None,
     amp: bool = False,
     amp_dtype: torch.dtype | None = None,
+    soundfont_path: Path | str | None = None,
+    fluidsynth_executable: Path | str | None = None,
+    render_compare_config: RenderCompareConfig | None = None,
 ) -> dict[str, Path]:
     """ステム音声を使って各ステム MIDI の楽器ラベルを付け直す。
 
@@ -623,6 +629,9 @@ def refine_stem_instrument_midis(
                 preloaded_waveform=preloaded_waveform,
                 amp=amp,
                 amp_dtype=amp_dtype,
+                soundfont_path=soundfont_path,
+                fluidsynth_executable=fluidsynth_executable,
+                render_compare_config=render_compare_config,
             )
         finally:
             if low_vram_mode:
@@ -632,9 +641,9 @@ def refine_stem_instrument_midis(
 
         refined_class_names = sorted(
             {
-                cluster["candidates"][0]["class_name"]
+                str(cluster.get("selected_program_name") or cluster["candidates"][0]["class_name"])
                 for cluster in report["clusters"]
-                if cluster["candidates"]
+                if cluster.get("selected_program_name") or cluster["candidates"]
             }
         )
         print(
@@ -678,6 +687,9 @@ def run_stem_separated_transcription(
     refinement_checkpoint_path: Path | str | None = None,
     refinement_mode: str = "cluster",
     refinement_stem_names: Sequence[str] | None = None,
+    refinement_soundfont_path: Path | str | None = None,
+    refinement_fluidsynth_executable: Path | str | None = None,
+    refinement_render_compare_config: RenderCompareConfig | None = None,
     predict_velocity: bool = True,
     velocity_checkpoint_path: Path | str | None = None,
     predict_beat_chord: bool = False,
@@ -922,6 +934,9 @@ def run_stem_separated_transcription(
                 waveform_loader=load_run_waveform,
                 amp=amt_amp_enabled,
                 amp_dtype=amt_amp_dtype,
+                soundfont_path=refinement_soundfont_path,
+                fluidsynth_executable=refinement_fluidsynth_executable,
+                render_compare_config=refinement_render_compare_config,
             )
             if refined_midi_paths:
                 stem_midi_paths.update(refined_midi_paths)
