@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import math
 from collections import defaultdict, deque
 from dataclasses import dataclass
@@ -23,6 +24,10 @@ from ...runtime import (
 )
 from ..modeling.checkpoints import load_checkpoint, select_state_dict
 from ..modeling.model import VelocityModelConfig, VelocityPredictionModel
+from ..render_compare_velocity import (
+    RenderCompareVelocityConfig,
+    optimize_velocity_and_mix_by_render_compare,
+)
 from ..stems import STEM_CLASS_BY_NAME, STEM_NAMES, UNKNOWN_STEM_CLASS
 
 HF_CHECKPOINT_BASE_URL = "https://huggingface.co/anime-song/instrument_agnostic_amt/resolve/main"
@@ -785,7 +790,13 @@ def predict_velocity_for_midi(
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Predict MIDI note velocity from separated stem audio files.")
-    parser.add_argument("--midi", type=Path, required=True, help="Input MIDI file path")
+    parser.add_argument("--midi", type=Path, help="Input MIDI file path")
+    parser.add_argument(
+        "--stem-midis-dir",
+        type=Path,
+        default=None,
+        help="Directory containing per-stem MIDI files (used with --soundfont Render & Compare mode)",
+    )
     parser.add_argument(
         "--stems-dir",
         type=Path,
@@ -800,6 +811,40 @@ def parse_args() -> argparse.Namespace:
         "--output-midi",
         type=Path,
         help="Output MIDI file path with updated velocity",
+    )
+    parser.add_argument(
+        "--output-json",
+        type=Path,
+        default=None,
+        help="Optional JSON report path for Render & Compare velocity optimization",
+    )
+    parser.add_argument(
+        "--soundfont",
+        type=Path,
+        default=None,
+        help="SoundFont (.sf2) to enable closed-loop Render & Compare velocity and CC#7 optimization",
+    )
+    parser.add_argument(
+        "--fluidsynth-executable",
+        type=Path,
+        default=None,
+        help="Path to fluidsynth executable. Searches PATH when omitted.",
+    )
+    parser.add_argument(
+        "--render-compare-iterations",
+        type=int,
+        default=3,
+        help="Number of closed-loop Render & Compare optimization iterations",
+    )
+    parser.add_argument(
+        "--no-optimize-cc7",
+        action="store_true",
+        help="Keep CC#7 fixed and optimize note velocities only in Render & Compare mode",
+    )
+    parser.add_argument(
+        "--use-input-velocity-init",
+        action="store_true",
+        help="Start Render & Compare from existing MIDI note velocities instead of a uniform value",
     )
     parser.add_argument(
         "--checkpoint",
@@ -858,11 +903,77 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
+def _resolve_stem_midi_directory(stem_midis_dir: Path) -> dict[str, Path]:
+    resolved: dict[str, Path] = {}
+    for midi_file in sorted(stem_midis_dir.glob("*.mid")):
+        stem_lower = midi_file.stem.lower()
+        for known_name in STEM_NAMES:
+            if f"_{known_name}" in stem_lower or stem_lower == known_name:
+                resolved[known_name] = midi_file
+                break
+    return resolved
+
+
 def main() -> None:
     args = parse_args()
     stems_input = args.stems_dir if args.stems_dir is not None else args.stem_files
     if stems_input is None:
         raise ValueError("Either --stems-dir or --stem-files must be specified.")
+
+    if args.soundfont is not None:
+        resolved_audios = _resolve_stem_files(stems_input)
+        if args.stem_midis_dir is not None:
+            stem_midis = _resolve_stem_midi_directory(args.stem_midis_dir)
+            default_output = args.stem_midis_dir / "merged_rc_velocity.mid"
+        elif args.midi is not None:
+            # 単一 MIDI からステム別一時 MIDI を切り出して Render & Compare へ渡す。
+            midi_object = pretty_midi.PrettyMIDI(str(args.midi))
+            stem_midis = {}
+            for instrument in midi_object.instruments:
+                candidates = [name for name in STEM_NAMES if name in instrument.name.lower()]
+                stem_name = "drums" if instrument.is_drum else (candidates[0] if candidates else "other")
+                temp_path = args.midi.parent / f"_temp_rc_{stem_name}.mid"
+                if stem_name not in stem_midis:
+                    temp_midi = pretty_midi.PrettyMIDI(str(args.midi))
+                    temp_midi.instruments = [instrument]
+                    temp_midi.write(str(temp_path))
+                    stem_midis[stem_name] = temp_path
+                else:
+                    temp_midi = pretty_midi.PrettyMIDI(str(temp_path))
+                    temp_midi.instruments.append(instrument)
+                    temp_midi.write(str(temp_path))
+            default_output = args.midi.parent / f"{args.midi.stem}_rc_velocity.mid"
+        else:
+            raise ValueError("Either --midi or --stem-midis-dir must be specified.")
+
+        try:
+            report = optimize_velocity_and_mix_by_render_compare(
+                stem_midis=stem_midis,
+                stem_audios=resolved_audios,
+                config=RenderCompareVelocityConfig(
+                    soundfont_path=args.soundfont,
+                    fluidsynth_executable=args.fluidsynth_executable,
+                    num_iterations=int(args.render_compare_iterations),
+                    optimize_volume_cc7=not args.no_optimize_cc7,
+                    use_input_velocity_as_init=bool(args.use_input_velocity_init),
+                    max_melodic_instruments=int(args.max_midi_melodic_instruments),
+                ),
+                output_midi_path=args.output_midi or default_output,
+            )
+        finally:
+            for path in stem_midis.values():
+                if path.name.startswith("_temp_rc_"):
+                    path.unlink(missing_ok=True)
+
+        if args.output_json is not None:
+            args.output_json.parent.mkdir(parents=True, exist_ok=True)
+            args.output_json.write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
+        print(json.dumps({"iterations": report["iterations"], "tracks": report["tracks"]}, ensure_ascii=False, indent=2))
+        print(f"Successfully generated Render & Compare velocity MIDI: {report['output_midi_path']}")
+        return
+
+    if args.midi is None:
+        raise ValueError("--midi is required unless --soundfont and --stem-midis-dir are used.")
 
     output_path = predict_velocity_for_midi(
         midi_path=args.midi,

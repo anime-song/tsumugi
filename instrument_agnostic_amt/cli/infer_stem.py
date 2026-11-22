@@ -41,6 +41,10 @@ from instrument_agnostic_amt.velocity.cli.infer_velocity import (
     load_velocity_model,
     predict_velocity_for_stem_midis,
 )
+from instrument_agnostic_amt.velocity.render_compare_velocity import (
+    RenderCompareVelocityConfig,
+    optimize_velocity_and_mix_by_render_compare,
+)
 from instrument_agnostic_amt.instrument_refinement.data.labels import (
     inference_stem_group,
 )
@@ -692,6 +696,9 @@ def run_stem_separated_transcription(
     refinement_render_compare_config: RenderCompareConfig | None = None,
     predict_velocity: bool = True,
     velocity_checkpoint_path: Path | str | None = None,
+    velocity_soundfont_path: Path | str | None = None,
+    velocity_fluidsynth_executable: Path | str | None = None,
+    velocity_render_compare_config: RenderCompareVelocityConfig | None = None,
     predict_beat_chord: bool = False,
     beat_chord_checkpoint_path: Path | str | None = None,
     beat_chord_use_audio: bool = True,
@@ -960,9 +967,48 @@ def run_stem_separated_transcription(
         max_melodic_instruments=max_midi_melodic_instruments,
     )
 
-    # 6. Velocity予測を実行し、MIDIノートの強弱を補正する。
+    # 6. Velocity予測（または SoundFont 指定時は Render & Compare 閉ループ最適化）を実行する。
     preloaded_velocity_waveforms: dict[str, torch.Tensor] | None = None
-    if predict_velocity:
+    effective_velocity_rc_config = velocity_render_compare_config
+    if effective_velocity_rc_config is None and velocity_soundfont_path is not None:
+        effective_velocity_rc_config = RenderCompareVelocityConfig(
+            soundfont_path=Path(velocity_soundfont_path),
+            fluidsynth_executable=(
+                Path(velocity_fluidsynth_executable) if velocity_fluidsynth_executable is not None else None
+            ),
+            max_melodic_instruments=int(max_midi_melodic_instruments),
+        )
+
+    if predict_velocity and effective_velocity_rc_config is not None:
+        try:
+            print("Optimizing note velocities and track CC#7 via Render & Compare...")
+            stem_midis_map = {
+                stem_name: midi_path
+                for stem_name, midi_path in stem_midi_paths.items()
+                if Path(midi_path).exists()
+            }
+            velocity_midi_path = merged_dir / f"{audio_file.stem}_velocity.mid"
+            rc_report = optimize_velocity_and_mix_by_render_compare(
+                stem_midis=stem_midis_map,
+                stem_audios=stems,
+                config=effective_velocity_rc_config,
+                original_mix_audio=audio_file,
+                output_midi_path=velocity_midi_path,
+            )
+            merged_midi_path = velocity_midi_path
+            if rc_report["iterations"]:
+                first_mae = rc_report["iterations"][0]["overall_mae_db"]
+                last_mae = rc_report["iterations"][-1]["overall_mae_db"]
+                print(
+                    f"Updated merged MIDI with Render & Compare velocity/CC#7 "
+                    f"(MAE: {first_mae:.2f} dB -> {last_mae:.2f} dB): {merged_midi_path}"
+                )
+        except Exception as err:
+            print(f"Warning: Render & Compare velocity optimization skipped due to error: {err}")
+        finally:
+            if waveform_cache is not None:
+                waveform_cache.clear()
+    elif predict_velocity:
         velocity_model = None
         try:
             print("Predicting note velocities from separated stems...")
