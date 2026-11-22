@@ -28,14 +28,17 @@ BANK_MSB_DEFAULT = 0
 N_COMPONENTS = 15          # port 1 has 16 channels; ch9 (drums) is skipped
 SKIP_CHANNELS = {9}
 BEND_RANGE_SEMI = 12.0     # pitch bend range set through RPN
-CC_GAIN_FLOOR = 0.20       # lowest linear gain of the CC curve, about -14 dB
+# CC11 gain maps directly to the true harmonic amplitude; no floor, no lift.
+# A floor is deliberately avoided: it would raise weak high harmonics far above
+# their real level and make the top band louder than the fundamental.
+CC_MASTER_GAIN_DB = 0.0    # global level trim for the vocal port; 0.0 = exact
+# measured amplitudes. Raises all port channels equally (keeps harmonic balance).
+CC_MASTER_GAIN = 10.0 ** (CC_MASTER_GAIN_DB / 20.0)
+ACCOMPANIMENT_CC7 = 70     # channel volume written to every accompaniment track
 CC_STEP_MIN = 2            # smallest CC11 change worth writing, about 0.7 dB
 SMOOTH_FRAMES = 9          # temporal low-pass width for the level curve, in frames
 CC7_VALUE = 127            # channel volume for the vocal channels
-DUCK_CC7_VALUE = 90        # channel volume for original vocals tracks, leaves room for port 1
-# Instrument names the vocals stem can be split into
-VOCAL_STEM_INSTRUMENT_NAMES = {"melody", "vocal_harmony", "choir"}
-COMP_GATE_DB = 45.0        # component is muted when 45 dB below the global peak
+COMP_GATE_DB = 45.0        # a frame is silent when f0 is 45 dB below its own peak
 MIN_RUN_FRAMES = 2         # shortest note, in frames
 
 def _sec2tick_factory(mid: mido.MidiFile):
@@ -103,12 +106,42 @@ def _smooth_frame_levels(frames: list) -> None:
         frames[i] = (frames[i][0], float(full[i]))
 
 
-def _component_segments(track, k: int, sec2tick, gate_db: float) -> list[dict]:
-    """Note segments of harmonic k, split at gate boundaries.
+def _f0_level_db(track, i: int) -> float:
+    """Absolute level of the fundamental (k=1) in frame i."""
+    f = float(track.f0[i])
+    rel = float(np.interp(np.log2(max(f, 1e-9)), np.log2(track.centers_h),
+                          track.harm_band_db[i]))
+    return float(track.harm_peak_db[i]) + rel
+
+
+def _active_frames(track, gate_db: float) -> np.ndarray:
+    """Per-frame mask where f0 is voiced and above the gate.
+
+    This is the ONLY place the silence threshold is applied. Every harmonic
+    component reuses the same mask, so all channels start and stop on the same
+    frames instead of gating independently per frequency band.
+    """
+    nfr = track.n_frames
+    active = np.zeros(nfr, dtype=bool)
+    for i in range(nfr):
+        if not track.voiced[i] or track.f0[i] <= 0:
+            continue
+        if _f0_level_db(track, i) >= gate_db:
+            active[i] = True
+    return active
+
+
+def _component_segments(track, k: int, sec2tick, active: np.ndarray,
+                        ref_db: float) -> list[dict]:
+    """Note segments of harmonic k, split only where the f0 gate closes.
+
+    Segment boundaries come from `active` (f0 only); abs_db no longer decides
+    silence, it only feeds the per-frame CC11 level curve. CC11 is referenced to
+    the f0 peak (`ref_db`) shared by every harmonic, so a weaker harmonic stays
+    quieter than the fundamental instead of being normalized to its own peak.
 
     Returns {'vel': int, 'segs': [(start_tick, end_tick, note, bends, expr)]}.
     """
-    voiced = track.voiced
     f0 = track.f0
     nfr = track.n_frames
     hop = track.hop_size / track.sample_rate
@@ -116,7 +149,7 @@ def _component_segments(track, k: int, sec2tick, gate_db: float) -> list[dict]:
 
     frames = []
     for i in range(nfr):
-        if not voiced[i] or f0[i] <= 0:
+        if not active[i]:
             frames.append(None)
             continue
         freq = k * f0[i]
@@ -125,12 +158,10 @@ def _component_segments(track, k: int, sec2tick, gate_db: float) -> list[dict]:
             continue
         rel_db = float(np.interp(np.log2(freq), np.log2(track.centers_h), track.harm_band_db[i]))
         abs_db = float(track.harm_peak_db[i]) + rel_db
-        if abs_db < gate_db:
-            frames.append(None)
-        else:
-            frames.append((freq, abs_db))
+        frames.append((freq, abs_db))
 
-    _smooth_frame_levels(frames)
+    # Faithful mode: no temporal smoothing of the level curve. CC11 carries the
+    # measured per-frame harmonic amplitude unchanged.
 
     segs = []
     i = 0
@@ -171,18 +202,22 @@ def _component_segments(track, k: int, sec2tick, gate_db: float) -> list[dict]:
     if not segs:
         return {}
 
-    # Velocity stays at 127; loudness is carried by the CC curve, referenced to
-    # the loudest frame of the same channel so dynamics stay within the channel.
-    ref_db = max(db for sg in segs for _, db in sg["frames"])
+    # Velocity stays at 127; loudness is carried by the CC curve. Every channel
+    # uses the same f0 reference passed in, so harmonic balance is preserved:
+    # a quiet upper harmonic stays quiet instead of being lifted to full scale.
     out_segs = []
     last_val = None
     for sg in segs:
         expr_t = []
         for idx, db in sg["frames"]:
-            ratio = 10.0 ** ((db - ref_db) / 20.0)
-            gain = CC_GAIN_FLOOR + (1.0 - CC_GAIN_FLOOR) * ratio
-            # GM2 volume curve: amplitude = (cc / 127) ** 2
-            val = int(np.clip(round(127.0 * np.sqrt(gain)), 0, 127))
+            # True linear amplitude of this harmonic relative to the f0 peak.
+            # No per-channel floor: the ONLY scaling is a single global gain
+            # shared by every channel, so the harmonic balance is untouched.
+            ratio = (10.0 ** ((db - ref_db) / 20.0)) * CC_MASTER_GAIN
+            # GM2 volume curve: amplitude = (cc / 127) ** 2, so cc = 127 * sqrt(amp).
+            # The sqrt is the physical inverse of the synth curve, not a shaping step:
+            # it makes the played-back amplitude equal the measured amplitude.
+            val = int(np.clip(round(127.0 * np.sqrt(ratio)), 0, 127))
             # The curve runs across segment boundaries, so a change below the
             # audible step is dropped instead of being rewritten every frame.
             if last_val is None or abs(val - last_val) >= CC_STEP_MIN:
@@ -192,39 +227,28 @@ def _component_segments(track, k: int, sec2tick, gate_db: float) -> list[dict]:
     return {"vel": 127, "segs": out_segs}
 
 
-def _strip_instrument_cc7(mid: mido.MidiFile) -> list[str]:
-    """Drop the hardcoded CC7=127 from instrument tracks so they fall back to 100."""
-    stripped: list[str] = []
+def _set_instrument_cc7(mid: mido.MidiFile, value: int) -> list[str]:
+    """Set CC7 of every accompaniment track to `value`.
+
+    This is a channel-level volume trim only: note velocities (which shape the
+    timbre/brightness) are left untouched. Tracks without an existing CC7 get one
+    inserted at tick 0. Every accompaniment track is treated alike.
+    """
+    changed: list[str] = []
     for tr in mid.tracks:
         name = (tr.name or "").strip().lower()
-        if name in VOCAL_STEM_INSTRUMENT_NAMES:
-            continue  # handled by the ducking step
-        idx = [i for i, m in enumerate(tr) if m.type == "control_change" and m.control == 7]
-        if not idx:
-            continue
-        for i in reversed(idx):
-            del tr[i]
-        stripped.append(name or f"ch{next((m.channel for m in tr if hasattr(m, 'channel')), '?')}")
-    return stripped
-
-
-def _duck_vocals_stem_tracks(mid: mido.MidiFile, value: int) -> list[str]:
-    """Set CC7 of the original vocals tracks (melody / vocal_harmony / choir) to value."""
-    ducked: list[str] = []
-    for tr in mid.tracks:
-        name = (tr.name or "").strip().lower()
-        if name not in VOCAL_STEM_INSTRUMENT_NAMES:
+        ch = next((m.channel for m in tr if hasattr(m, "channel")), None)
+        if ch is None:
             continue
         cc7 = [m for m in tr if m.type == "control_change" and m.control == 7]
         if cc7:
             for m in cc7:
                 m.value = int(value)
         else:
-            ch = next((m.channel for m in tr if hasattr(m, "channel")), 0)
             tr.insert(0, mido.Message("control_change", channel=ch, control=7,
                                       value=int(value), time=0))
-        ducked.append(name)
-    return ducked
+        changed.append(name or f"ch{ch}")
+    return changed
 
 
 def add_vocal_port(
@@ -235,8 +259,7 @@ def add_vocal_port(
     program: int = PROGRAM_DEFAULT,
     bank_msb: int = BANK_MSB_DEFAULT,
     volume_cc: int = 11,
-    duck_cc7: int | None = DUCK_CC7_VALUE,
-    strip_instrument_cc7: bool = True,
+    accompaniment_cc7: int | None = ACCOMPANIMENT_CC7,
 ) -> Path:
     """Append a port-1 vocal track to midi_path and write out_path (*_vocalport.mid)."""
     midi_path = Path(midi_path)
@@ -253,19 +276,22 @@ def add_vocal_port(
     mid = mido.MidiFile(str(midi_path))
     sec2tick = _sec2tick_factory(mid)
 
-    if strip_instrument_cc7:
-        stripped = _strip_instrument_cc7(mid)
-        if stripped:
-            print(f"[vocal-port] removed CC7=127 from {len(stripped)} instrument tracks (fallback 100): {stripped}")
+    # Channel-level volume trim on accompaniment only. Note velocities are not
+    # touched, so timbre/brightness is preserved. Runs before the voice track is
+    # appended; the port's own CC7 stays at CC7_VALUE.
+    if accompaniment_cc7 is not None:
+        changed = _set_instrument_cc7(mid, accompaniment_cc7)
+        if changed:
+            print(f"[vocal-port] set CC7={accompaniment_cc7} on {len(changed)} "
+                  f"accompaniment tracks: {changed}")
 
-    if duck_cc7 is not None:
-        ducked = _duck_vocals_stem_tracks(mid, duck_cc7)
-        if ducked:
-            print(f"[vocal-port] ducked CC7={duck_cc7} on original vocals tracks: {ducked}")
-
-    # Global peak acts as the gate reference for every harmonic component
-    peak = float(np.max(track.harm_peak_db[track.voiced])) if track.voiced.any() else 0.0
+    # f0 alone decides which frames are active; every harmonic shares the mask
+    f0_levels = [_f0_level_db(track, i) for i in range(nfr)
+                 if track.voiced[i] and track.f0[i] > 0]
+    peak = float(np.max(f0_levels)) if f0_levels else 0.0
     gate_db = peak - COMP_GATE_DB
+    active = _active_frames(track, gate_db)
+    print(f"[vocal-port] f0 gate {gate_db:.1f} dB, {int(active.sum())}/{nfr} frames active")
 
     channels = [c for c in range(16) if c not in SKIP_CHANNELS][:n_components]
     voc_track = mido.MidiTrack()
@@ -273,7 +299,7 @@ def add_vocal_port(
     used = 0
     for ci, ch in enumerate(channels):
         k = ci + 1  # harmonic index
-        run = _component_segments(track, k, sec2tick, gate_db)
+        run = _component_segments(track, k, sec2tick, active, peak)
         if not run:
             continue
         used += 1
