@@ -24,6 +24,7 @@ from instrument_agnostic_amt.beat_chord.cli.infer import (
     predict_beat_chord_for_midi,
 )
 from instrument_agnostic_amt.beat_chord.sheetsage import (
+    SheetSageBeatGrid,
     load_sheetsage_model,
     predict_sheetsage_beat_grid,
 )
@@ -35,6 +36,11 @@ from instrument_agnostic_amt.instrument_refinement.inference.refine import (
 )
 from instrument_agnostic_amt.instrument_refinement.inference.render_compare import (
     RenderCompareConfig,
+)
+from instrument_agnostic_amt.quantization.render_compare_quantize import (
+    BeatGridInput,
+    RenderCompareQuantizeConfig,
+    quantize_stems_by_render_compare,
 )
 from instrument_agnostic_amt.velocity.cli.infer_velocity import (
     ensure_velocity_checkpoint,
@@ -699,6 +705,10 @@ def run_stem_separated_transcription(
     velocity_soundfont_path: Path | str | None = None,
     velocity_fluidsynth_executable: Path | str | None = None,
     velocity_render_compare_config: RenderCompareVelocityConfig | None = None,
+    quantize_with_render_compare: bool = False,
+    quantize_soundfont_path: Path | str | None = None,
+    quantize_fluidsynth_executable: Path | str | None = None,
+    quantize_render_compare_config: RenderCompareQuantizeConfig | None = None,
     predict_beat_chord: bool = False,
     beat_chord_checkpoint_path: Path | str | None = None,
     beat_chord_use_audio: bool = True,
@@ -957,6 +967,85 @@ def run_stem_separated_transcription(
             if not predict_velocity and waveform_cache is not None:
                 waveform_cache.clear()
 
+    # 4.8 (任意) Render & Compare 型ビート量子化:
+    #     SheetSage2-Refined でビート格子を先に取得し、オンセットズレを各ステム単位で補正する。
+    #     位相アラインメント済みのビート格子は後段の Step 6.5 (Beat/Chord テンポマップ書き出し) でも再利用する。
+    precomputed_sheetsage_beat_grid: SheetSageBeatGrid | None = None
+    quantized_with_render_compare = False
+    quantized_stem_midi_dir = run_root / "quantized_stem_midis"
+    effective_quantize_config = quantize_render_compare_config
+    resolved_quantize_soundfont = quantize_soundfont_path or velocity_soundfont_path or refinement_soundfont_path
+    resolved_quantize_fluidsynth = (
+        quantize_fluidsynth_executable or velocity_fluidsynth_executable or refinement_fluidsynth_executable
+    )
+    if effective_quantize_config is None and quantize_with_render_compare and resolved_quantize_soundfont is not None:
+        effective_quantize_config = RenderCompareQuantizeConfig(
+            soundfont_path=Path(resolved_quantize_soundfont),
+            fluidsynth_executable=(
+                Path(resolved_quantize_fluidsynth) if resolved_quantize_fluidsynth is not None else None
+            ),
+            max_melodic_instruments=int(max_midi_melodic_instruments),
+            write_tempo_map=False,
+        )
+
+    if quantize_with_render_compare and effective_quantize_config is not None:
+        sheetsage_model = None
+        try:
+            print("Predicting beats with SheetSage2-Refined for Render & Compare quantization...")
+            if low_vram_mode:
+                sheetsage_model = get_sheetsage_model(device_preference="cpu")
+                _move_sheetsage_model(sheetsage_model, device)
+            else:
+                sheetsage_model = get_sheetsage_model(device_preference=device)
+            source_waveform, source_sample_rate = _load_audio_channels_first(audio_file)
+            precomputed_sheetsage_beat_grid, sheetsage_beats = predict_sheetsage_beat_grid(
+                sheetsage_model,
+                source_waveform.mean(axis=0),
+                source_sample_rate,
+            )
+            del source_waveform
+            sheetsage_json_path = merged_dir / f"{audio_file.stem}_sheetsage2.beats.json"
+            sheetsage_json_path.write_text(
+                json.dumps({"audio": str(audio_file)} | sheetsage_beats, ensure_ascii=False),
+                encoding="utf-8",
+            )
+            beat_grid_input = BeatGridInput(
+                beat_times=precomputed_sheetsage_beat_grid.beat_times,
+                downbeat_times=precomputed_sheetsage_beat_grid.downbeat_times,
+                meter_segments=precomputed_sheetsage_beat_grid.meter_segments,
+            )
+            print("Quantizing stem MIDI timings via Render & Compare...")
+            quantize_report = quantize_stems_by_render_compare(
+                stem_midis=stem_midi_paths,
+                stem_audios=stems,
+                beat_grid=beat_grid_input,
+                config=effective_quantize_config,
+                original_mix_audio=audio_file,
+                output_stem_dir=quantized_stem_midi_dir,
+            )
+            if quantize_report.get("output_stem_paths"):
+                stem_midi_paths.update(
+                    {name: Path(path) for name, path in quantize_report["output_stem_paths"].items()}
+                )
+                quantized_with_render_compare = True
+                phase_shift_seconds = float(quantize_report.get("beat_phase_shift_ms", 0.0)) / 1000.0
+                if abs(phase_shift_seconds) > 1e-6:
+                    shifted_grid = beat_grid_input.shifted(phase_shift_seconds)
+                    precomputed_sheetsage_beat_grid = SheetSageBeatGrid(
+                        beat_times=shifted_grid.beat_times,
+                        downbeat_times=shifted_grid.downbeat_times,
+                        meter_segments=shifted_grid.meter_segments,
+                    )
+                print(
+                    f"Quantized stem MIDI files (beat_shift={quantize_report['beat_phase_shift_ms']:+.1f} ms): "
+                    f"{sorted(quantize_report['output_stem_paths'])}"
+                )
+        except Exception as err:
+            print(f"Warning: Render & Compare quantization skipped due to error: {err}")
+        finally:
+            if low_vram_mode and sheetsage_model is not None:
+                _move_sheetsage_model(sheetsage_model, "cpu")
+
     song_midi_paths = [stem_midi_paths[stem_name] for stem_name in sorted(stem_midi_paths)]
 
     # 5. ステムごとの MIDI を 1 本にまとめる。
@@ -1081,8 +1170,8 @@ def run_stem_separated_transcription(
         try:
             # beat_source="sheetsage2" では、ビート・ダウンビート・拍子を元音源から
             # SheetSage2-Refined のビートトラッカーで推定する。失敗したら tsumugi のビートで続ける。
-            sheetsage_beat_grid = None
-            if beat_source == "sheetsage2":
+            sheetsage_beat_grid = precomputed_sheetsage_beat_grid
+            if beat_source == "sheetsage2" and sheetsage_beat_grid is None:
                 sheetsage_model = None
                 try:
                     print("Predicting beats and meters with SheetSage2-Refined...")
@@ -1183,5 +1272,8 @@ def run_stem_separated_transcription(
     }
     if instruments_refined:
         result["refined_stem_midi_dir"] = str(refined_stem_midi_dir)
+    if quantized_with_render_compare:
+        result["quantized_with_render_compare"] = True
+        result["quantized_stem_midi_dir"] = str(quantized_stem_midi_dir)
     print("Final Merged MIDI:", merged_midi_path)
     return result

@@ -884,6 +884,24 @@ def _merge_optimized_stem_midis(
 
     final_instruments = [*melodic, *drums]
     for instrument in final_instruments:
+        # 16ch 制約によるトラック統合 (Other / Merged 等) や複数ステム合流で同ピッチノートが重なり
+        # FluidSynth 等で発音消失するのを防ぐため、先行ノートの終端を後続ノート開始の直前で切る。
+        notes_by_pitch: dict[int, list[pretty_midi.Note]] = {}
+        for note in instrument.notes:
+            notes_by_pitch.setdefault(int(note.pitch), []).append(note)
+        for pitch_notes in notes_by_pitch.values():
+            pitch_notes.sort(key=lambda item: (item.start, item.end))
+            for index in range(1, len(pitch_notes)):
+                previous = pitch_notes[index - 1]
+                current = pitch_notes[index]
+                if float(current.start) <= float(previous.start) + 0.005:
+                    current.start = float(previous.start) + 0.005
+                    current.end = max(float(current.end), float(current.start) + 0.015)
+                if float(previous.end) > float(current.start) - 0.005:
+                    previous.end = max(
+                        float(previous.start) + min(0.010, (float(current.start) - float(previous.start)) * 0.7),
+                        float(current.start) - 0.005,
+                    )
         instrument.notes.sort(key=lambda note: (note.start, note.pitch, note.end))
         instrument.control_changes.sort(key=lambda control: (control.time, control.number))
         instrument.pitch_bends.sort(key=lambda bend: bend.time)
