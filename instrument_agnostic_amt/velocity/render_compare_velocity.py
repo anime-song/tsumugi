@@ -106,6 +106,10 @@ class RenderCompareVelocityConfig:
     # フィードバックして Aメロ〜サビのフルミックス整合性を取る (0.0 で無効)。
     full_mix_feedback_weight: float = 0.45
     full_mix_window_seconds: float = 0.25
+    # 1-C: ステレオ分離ステムからの左右パン (CC#10) 抽出。
+    # 持続系楽器の動的強弱 (CC#11) は SoundFont のアタックと干渉しやすいため既定では無効（オプトイン）。
+    optimize_pan_cc10: bool = True
+    optimize_expression_cc11: bool = False
     max_melodic_instruments: int = 15
     evaluate_final: bool = True
 
@@ -182,18 +186,26 @@ class _StemAcousticMeasurement:
     note_levels_db: dict[int, float]
 
 
-def _load_mono_audio(audio_path: Path, *, target_sample_rate: int) -> np.ndarray:
-    """音声を指定サンプルレートの 1 次元 float32 モノラル波形として読み込む。"""
+def _load_stereo_audio(audio_path: Path, *, target_sample_rate: int) -> np.ndarray:
+    """音声を指定サンプルレートの 2 チャンネル [2, T] float32 ステレオ波形として読み込む。"""
     waveform_numpy, source_sample_rate = sf.read(str(audio_path), dtype="float32", always_2d=True)
-    mono_numpy = waveform_numpy.mean(axis=1).astype(np.float32, copy=False)
+    if waveform_numpy.shape[1] == 1:
+        stereo_numpy = np.repeat(waveform_numpy.T, 2, axis=0)
+    else:
+        stereo_numpy = waveform_numpy[:, :2].T.copy()
     if int(source_sample_rate) != int(target_sample_rate):
         resampled = audio_functional.resample(
-            torch.from_numpy(mono_numpy).unsqueeze(0),
+            torch.from_numpy(stereo_numpy),
             int(source_sample_rate),
             int(target_sample_rate),
         )
-        return resampled.squeeze(0).numpy().astype(np.float32, copy=False)
-    return mono_numpy
+        return resampled.numpy().astype(np.float32, copy=False)
+    return stereo_numpy.astype(np.float32, copy=False)
+
+
+def _load_mono_audio(audio_path: Path, *, target_sample_rate: int) -> np.ndarray:
+    """音声を指定サンプルレートの 1 次元 float32 モノラル波形として読み込む。"""
+    return _load_stereo_audio(audio_path, target_sample_rate=target_sample_rate).mean(axis=0).astype(np.float32, copy=False)
 
 
 def _apply_k_weighting(mono_audio: np.ndarray, *, sample_rate: int) -> np.ndarray:
@@ -780,18 +792,27 @@ def _smooth_track_velocities(
         note_state.velocity = float(np.clip(value, track_min_velocity, config.max_velocity))
 
 
-def _set_track_volume_controls(instrument: pretty_midi.Instrument, *, volume_cc7: int) -> None:
-    """トラックの CC#7 (Volume) を更新し、CC#11 (Expression) を 127 に揃える。"""
+def _set_track_volume_controls(
+    instrument: pretty_midi.Instrument,
+    *,
+    volume_cc7: int,
+    preserve_expression_cc11: bool = False,
+) -> None:
+    """トラックの CC#7 (Volume) を更新する。
+
+    preserve_expression_cc11=True かつ既に CC#11 が設定済みの場合はそれを保持し、
+    未設定のときだけ CC#11=127 を補う。
+    """
+    has_existing_cc11 = any(int(control.number) == 11 for control in instrument.control_changes)
+    keep_existing_cc11 = preserve_expression_cc11 and has_existing_cc11
+    excluded = (7,) if keep_existing_cc11 else (7, 11)
     instrument.control_changes = [
-        control for control in instrument.control_changes if int(control.number) not in (7, 11)
+        control for control in instrument.control_changes if int(control.number) not in excluded
     ]
-    instrument.control_changes.extend(
-        [
-            pretty_midi.ControlChange(number=7, value=int(volume_cc7), time=0.0),
-            pretty_midi.ControlChange(number=11, value=127, time=0.0),
-        ]
-    )
-    instrument.control_changes.sort(key=lambda control: control.time)
+    instrument.control_changes.append(pretty_midi.ControlChange(number=7, value=int(volume_cc7), time=0.0))
+    if not keep_existing_cc11:
+        instrument.control_changes.append(pretty_midi.ControlChange(number=11, value=127, time=0.0))
+    instrument.control_changes.sort(key=lambda control: (control.time, control.number))
 
 
 def _merge_optimized_stem_midis(
@@ -820,8 +841,9 @@ def _merge_optimized_stem_midis(
                 cc7_weight_total[key] = 0.0
             target.notes.extend(copy.deepcopy(source.notes))
             target.pitch_bends.extend(copy.deepcopy(source.pitch_bends))
+            # CC#10 (Pan) や 1-C で抽出した CC#11 (Expression) はそのまま引き継ぐ。
             target.control_changes.extend(
-                copy.deepcopy(control) for control in source.control_changes if int(control.number) not in (7, 11)
+                copy.deepcopy(control) for control in source.control_changes if int(control.number) != 7
             )
             source_cc7 = next((int(control.value) for control in source.control_changes if int(control.number) == 7), 100)
             note_weight = float(len(source.notes))
@@ -830,7 +852,7 @@ def _merge_optimized_stem_midis(
 
     for key, instrument in grouped_instruments.items():
         averaged_cc7 = int(np.clip(round(cc7_weighted_sum[key] / max(cc7_weight_total[key], 1.0)), 1, 127))
-        _set_track_volume_controls(instrument, volume_cc7=averaged_cc7)
+        _set_track_volume_controls(instrument, volume_cc7=averaged_cc7, preserve_expression_cc11=True)
 
     melodic = [instrument for instrument in grouped_instruments.values() if not instrument.is_drum]
     drums = [instrument for instrument in grouped_instruments.values() if instrument.is_drum]
@@ -863,7 +885,7 @@ def _merge_optimized_stem_midis(
     final_instruments = [*melodic, *drums]
     for instrument in final_instruments:
         instrument.notes.sort(key=lambda note: (note.start, note.pitch, note.end))
-        instrument.control_changes.sort(key=lambda control: control.time)
+        instrument.control_changes.sort(key=lambda control: (control.time, control.number))
         instrument.pitch_bends.sort(key=lambda bend: bend.time)
     merged.instruments = final_instruments
     return merged
@@ -895,8 +917,9 @@ def optimize_velocity_and_mix_by_render_compare(
     if not active_stems:
         raise ValueError("No matching stem MIDI and audio pairs were found.")
 
-    # 1. 元ステム音声・MIDI を読み込み、同一ステム内の重複トラックを統合して状態を構築する。
+    # 1. 元ステム音声（ステレオ + モノラル）・MIDI を読み込み、同一ステム内の重複トラックを統合する。
     loaded_midis: dict[str, pretty_midi.PrettyMIDI] = {}
+    target_stereo_waveforms: dict[str, np.ndarray] = {}
     target_waveforms: dict[str, np.ndarray] = {}
     stem_durations: dict[str, float] = {}
     tracks: list[_TrackState] = []
@@ -926,8 +949,10 @@ def optimize_velocity_and_mix_by_render_compare(
             instrument.control_changes.sort(key=lambda control: control.time)
         midi_object.instruments = consolidated_instruments
 
-        mono_audio = _load_mono_audio(resolved_audios[stem_name], target_sample_rate=sample_rate)
+        stereo_audio = _load_stereo_audio(resolved_audios[stem_name], target_sample_rate=sample_rate)
+        mono_audio = stereo_audio.mean(axis=0).astype(np.float32, copy=False)
         loaded_midis[stem_name] = midi_object
+        target_stereo_waveforms[stem_name] = stereo_audio
         target_waveforms[stem_name] = mono_audio
         stem_durations[stem_name] = max(0.25, float(mono_audio.size) / float(sample_rate))
         tracks_by_stem[stem_name] = []
@@ -1370,6 +1395,54 @@ def optimize_velocity_and_mix_by_render_compare(
                 "velocity_max": int(velocity_array.max()),
             }
         )
+
+    # 4.5 1-C: ステレオ分離ステムから左右パン (CC#10) と持続系楽器の動的強弱 (CC#11) を抽出・適用する。
+    pan_expression_by_track: dict[tuple[str, int, bool, str], dict[str, Any]] = {}
+    if config.optimize_pan_cc10 or config.optimize_expression_cc11:
+        from .expression_pan import ExpressionPanConfig, apply_pan_and_expression_to_stem_midi
+
+        expression_pan_config = ExpressionPanConfig(
+            sample_rate=sample_rate,
+            enable_pan_cc10=bool(config.optimize_pan_cc10),
+            enable_expression_cc11=bool(config.optimize_expression_cc11),
+            max_velocity=int(config.max_velocity),
+        )
+        for stem_name in stems_with_notes:
+            stem_reports = apply_pan_and_expression_to_stem_midi(
+                loaded_midis[stem_name],
+                target_stereo_waveforms[stem_name],
+                stem_name=stem_name,
+                config=expression_pan_config,
+            )
+            for item in stem_reports:
+                key = (
+                    str(item["stem_name"]),
+                    int(item["program_number"]),
+                    bool(item["is_drum"]),
+                    str(item["instrument_name"]),
+                )
+                pan_expression_by_track[key] = item
+
+        for track_report in track_reports:
+            key = (
+                str(track_report["stem_name"]),
+                int(track_report["program_number"]),
+                bool(track_report["is_drum"]),
+                str(track_report["instrument_name"]),
+            )
+            extra = pan_expression_by_track.get(key)
+            if extra is not None:
+                for field_name in (
+                    "base_pan",
+                    "pan_events",
+                    "pan_min",
+                    "pan_max",
+                    "expression_applied",
+                    "expression_events",
+                    "modulated_phrases",
+                ):
+                    if field_name in extra:
+                        track_report[field_name] = extra[field_name]
 
     written_stem_paths: dict[str, str] = {}
     if output_stem_dir is not None:

@@ -842,6 +842,22 @@ def parse_args() -> argparse.Namespace:
         help="Keep CC#7 fixed and optimize note velocities only in Render & Compare mode",
     )
     parser.add_argument(
+        "--no-optimize-pan",
+        action="store_true",
+        help="Disable stereo CC#10 pan extraction in Render & Compare mode",
+    )
+    parser.add_argument(
+        "--optimize-expression",
+        action="store_true",
+        help="Opt in to experimental sustained-instrument CC#11 expression extraction in Render & Compare mode",
+    )
+    parser.add_argument(
+        "--original-mix-audio",
+        type=Path,
+        default=None,
+        help="Optional original full-mix audio file for full-mix loudness consistency in Render & Compare mode",
+    )
+    parser.add_argument(
         "--use-input-velocity-init",
         action="store_true",
         help="Start Render & Compare from existing MIDI note velocities instead of a uniform value",
@@ -955,9 +971,12 @@ def main() -> None:
                     fluidsynth_executable=args.fluidsynth_executable,
                     num_iterations=int(args.render_compare_iterations),
                     optimize_volume_cc7=not args.no_optimize_cc7,
+                    optimize_pan_cc10=not args.no_optimize_pan,
+                    optimize_expression_cc11=bool(args.optimize_expression),
                     use_input_velocity_as_init=bool(args.use_input_velocity_init),
                     max_melodic_instruments=int(args.max_midi_melodic_instruments),
                 ),
+                original_mix_audio=args.original_mix_audio,
                 output_midi_path=args.output_midi or default_output,
             )
         finally:

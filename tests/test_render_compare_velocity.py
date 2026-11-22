@@ -229,6 +229,15 @@ def test_render_compare_velocity_converges_for_dynamics_chords_mix_and_drums(tmp
     assert drum_notes[0].velocity > drum_notes[1].velocity + 20  # t=0.2: Kick > HH
     assert drum_notes[2].velocity < drum_notes[3].velocity - 20  # t=1.0: Kick < HH
 
+    # 既定では CC#10 (Pan) が抽出され、CC#11 (Expression) は 127 固定のまま保持されること。
+    for track_name in ("Acoustic Grand Piano", "Distortion Guitar", "Drums"):
+        cc_numbers = {cc.number for cc in by_name[track_name].control_changes}
+        assert {7, 10, 11}.issubset(cc_numbers)
+        cc11_values = [cc.value for cc in by_name[track_name].control_changes if cc.number == 11]
+        assert cc11_values == [127]
+    drums_pan = [cc.value for cc in by_name["Drums"].control_changes if cc.number == 10]
+    assert drums_pan == [64]
+
 
 def test_velocity_cli_parses_render_compare_flags(monkeypatch) -> None:
     monkeypatch.setattr(
