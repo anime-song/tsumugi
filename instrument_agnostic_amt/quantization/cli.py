@@ -7,6 +7,10 @@ import json
 from pathlib import Path
 
 from ..velocity.cli.infer_velocity import _resolve_stem_files, _resolve_stem_midi_directory
+from .render_compare_defragment import (
+    RenderCompareDefragmentConfig,
+    defragment_stems_by_render_compare,
+)
 from .render_compare_quantize import (
     BeatGridInput,
     RenderCompareQuantizeConfig,
@@ -96,6 +100,21 @@ def parse_args() -> argparse.Namespace:
         help="Do not write aligned beat/meter tempo map into --output-midi",
     )
     parser.add_argument(
+        "--defragment",
+        action="store_true",
+        help="Run Render & Compare sustained-instrument note de-fragmentation before quantization",
+    )
+    parser.add_argument(
+        "--defragment-only",
+        action="store_true",
+        help="Run Render & Compare note de-fragmentation only (skip beat quantization)",
+    )
+    parser.add_argument(
+        "--defragment-include-plucked",
+        action="store_true",
+        help="Also include non-sustained instruments (piano, guitar, bass) during de-fragmentation",
+    )
+    parser.add_argument(
         "--max-midi-melodic-instruments",
         type=int,
         default=15,
@@ -131,6 +150,40 @@ def main() -> None:
     args = parse_args()
     stem_midis = _resolve_stem_midi_directory(args.stem_midis_dir)
     stem_audios = _resolve_stem_files(args.stems_dir)
+
+    defrag_report: dict[str, object] | None = None
+    if args.defragment or args.defragment_only:
+        defrag_stem_dir = (
+            args.output_stem_dir
+            if args.defragment_only and args.output_stem_dir is not None
+            else (args.stem_midis_dir / "defragmented_stem_midis")
+        )
+        defrag_output_midi = (
+            (args.output_midi or (args.stem_midis_dir / "merged_rc_defragmented.mid"))
+            if args.defragment_only
+            else None
+        )
+        defrag_report = defragment_stems_by_render_compare(
+            stem_midis=stem_midis,
+            stem_audios=stem_audios,
+            config=RenderCompareDefragmentConfig(
+                soundfont_path=args.soundfont,
+                fluidsynth_executable=args.fluidsynth_executable,
+                sustained_only=not args.defragment_include_plucked,
+                max_melodic_instruments=int(args.max_midi_melodic_instruments),
+            ),
+            output_midi_path=defrag_output_midi,
+            output_stem_dir=defrag_stem_dir,
+        )
+        if args.defragment_only:
+            if args.output_json is not None:
+                args.output_json.parent.mkdir(parents=True, exist_ok=True)
+                args.output_json.write_text(json.dumps(defrag_report, ensure_ascii=False, indent=2), encoding="utf-8")
+            print(json.dumps(defrag_report, ensure_ascii=False, indent=2))
+            print(f"Successfully generated Render & Compare defragmented MIDI: {defrag_report['output_midi_path']}")
+            return
+        stem_midis = {name: Path(path) for name, path in defrag_report["output_stem_paths"].items()}
+
     beat_grid = _resolve_beat_grid(args)
 
     output_midi = args.output_midi or (args.stem_midis_dir / "merged_rc_quantized.mid")
@@ -150,6 +203,8 @@ def main() -> None:
         output_midi_path=output_midi,
         output_stem_dir=args.output_stem_dir,
     )
+    if defrag_report is not None:
+        report["defragment"] = defrag_report
     if args.output_json is not None:
         args.output_json.parent.mkdir(parents=True, exist_ok=True)
         args.output_json.write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")

@@ -37,6 +37,10 @@ from instrument_agnostic_amt.instrument_refinement.inference.refine import (
 from instrument_agnostic_amt.instrument_refinement.inference.render_compare import (
     RenderCompareConfig,
 )
+from instrument_agnostic_amt.quantization.render_compare_defragment import (
+    RenderCompareDefragmentConfig,
+    defragment_stems_by_render_compare,
+)
 from instrument_agnostic_amt.quantization.render_compare_quantize import (
     BeatGridInput,
     RenderCompareQuantizeConfig,
@@ -705,6 +709,8 @@ def run_stem_separated_transcription(
     velocity_soundfont_path: Path | str | None = None,
     velocity_fluidsynth_executable: Path | str | None = None,
     velocity_render_compare_config: RenderCompareVelocityConfig | None = None,
+    defragment_with_render_compare: bool = False,
+    defragment_render_compare_config: RenderCompareDefragmentConfig | None = None,
     quantize_with_render_compare: bool = False,
     quantize_soundfont_path: Path | str | None = None,
     quantize_fluidsynth_executable: Path | str | None = None,
@@ -967,6 +973,43 @@ def run_stem_separated_transcription(
             if not predict_velocity and waveform_cache is not None:
                 waveform_cache.clear()
 
+    # 4.7 (任意) Phase 1-E: Render & Compare 過剰分割ノート結合（持続系オーケストラ楽器の細切れ防止）。
+    defragmented_with_render_compare = False
+    defragmented_stem_midi_dir = run_root / "defragmented_stem_midis"
+    resolved_quantize_soundfont = quantize_soundfont_path or velocity_soundfont_path or refinement_soundfont_path
+    resolved_quantize_fluidsynth = (
+        quantize_fluidsynth_executable or velocity_fluidsynth_executable or refinement_fluidsynth_executable
+    )
+    effective_defrag_config = defragment_render_compare_config
+    if effective_defrag_config is None and defragment_with_render_compare and resolved_quantize_soundfont is not None:
+        effective_defrag_config = RenderCompareDefragmentConfig(
+            soundfont_path=Path(resolved_quantize_soundfont),
+            fluidsynth_executable=(
+                Path(resolved_quantize_fluidsynth) if resolved_quantize_fluidsynth is not None else None
+            ),
+            max_melodic_instruments=int(max_midi_melodic_instruments),
+        )
+    if defragment_with_render_compare and effective_defrag_config is not None:
+        try:
+            print("De-fragmenting sustained-instrument stem MIDIs via Render & Compare...")
+            defrag_report = defragment_stems_by_render_compare(
+                stem_midis=stem_midi_paths,
+                stem_audios=stems,
+                config=effective_defrag_config,
+                output_stem_dir=defragmented_stem_midi_dir,
+            )
+            if defrag_report.get("output_stem_paths"):
+                stem_midi_paths.update(
+                    {name: Path(path) for name, path in defrag_report["output_stem_paths"].items()}
+                )
+                defragmented_with_render_compare = True
+                print(
+                    f"De-fragmented stem MIDIs (merged {defrag_report['total_merged_boundaries']} "
+                    f"boundaries: {defrag_report['total_before_notes']} -> {defrag_report['total_after_notes']} notes)"
+                )
+        except Exception as err:
+            print(f"Warning: Render & Compare note de-fragmentation skipped due to error: {err}")
+
     # 4.8 (任意) Render & Compare 型ビート量子化:
     #     SheetSage2-Refined でビート格子を先に取得し、オンセットズレを各ステム単位で補正する。
     #     位相アラインメント済みのビート格子は後段の Step 6.5 (Beat/Chord テンポマップ書き出し) でも再利用する。
@@ -974,10 +1017,6 @@ def run_stem_separated_transcription(
     quantized_with_render_compare = False
     quantized_stem_midi_dir = run_root / "quantized_stem_midis"
     effective_quantize_config = quantize_render_compare_config
-    resolved_quantize_soundfont = quantize_soundfont_path or velocity_soundfont_path or refinement_soundfont_path
-    resolved_quantize_fluidsynth = (
-        quantize_fluidsynth_executable or velocity_fluidsynth_executable or refinement_fluidsynth_executable
-    )
     if effective_quantize_config is None and quantize_with_render_compare and resolved_quantize_soundfont is not None:
         effective_quantize_config = RenderCompareQuantizeConfig(
             soundfont_path=Path(resolved_quantize_soundfont),
@@ -1272,6 +1311,9 @@ def run_stem_separated_transcription(
     }
     if instruments_refined:
         result["refined_stem_midi_dir"] = str(refined_stem_midi_dir)
+    if defragmented_with_render_compare:
+        result["defragmented_with_render_compare"] = True
+        result["defragmented_stem_midi_dir"] = str(defragmented_stem_midi_dir)
     if quantized_with_render_compare:
         result["quantized_with_render_compare"] = True
         result["quantized_stem_midi_dir"] = str(quantized_stem_midi_dir)
