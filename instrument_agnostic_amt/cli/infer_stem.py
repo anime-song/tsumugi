@@ -38,6 +38,7 @@ from instrument_agnostic_amt.velocity.cli.infer_velocity import (
     load_velocity_model,
     predict_velocity_for_stem_midis,
 )
+from instrument_agnostic_amt.whisper_lyrics import add_whisper_lyrics_to_vocals_midi
 from instrument_agnostic_amt.instrument_refinement.data.labels import (
     inference_stem_group,
 )
@@ -174,6 +175,18 @@ def merge_midis_logic(
         instrument.notes.sort(key=lambda note: note.start)
         instrument.control_changes.sort(key=lambda change: change.time)
         instrument.pitch_bends.sort(key=lambda pitch_bend: pitch_bend.time)
+
+    # 歌詞はステム MIDI 側に Lyric メタとして入っているので、マージ後にも引き継ぐ。
+    merged_lyrics: list[tuple[str, float]] = []
+    for path in midi_paths:
+        for lyric in pretty_midi.PrettyMIDI(str(path)).lyrics:
+            merged_lyrics.append((lyric.text, lyric.time))
+    if merged_lyrics:
+        merged_lyrics.sort(key=lambda item: item[1])
+        master_midi.lyrics = [
+            pretty_midi.Lyric(text=text, time=time) for text, time in merged_lyrics
+        ]
+
     output_path.parent.mkdir(parents=True, exist_ok=True)
     master_midi.write(str(output_path))
 
@@ -685,6 +698,15 @@ def run_stem_separated_transcription(
     beat_chord_use_audio: bool = True,
     beat_source: str = "sheetsage2",
     merge_onset_ms: float = 20.0,
+    transcribe_lyrics: bool = False,
+    lyrics_confidence_threshold: float = 0.65,
+    whisper_lyrics_language: str | None = None,
+    whisper_model_size: str = "small",
+    vocal_port: bool = False,
+    vocal_port_components: int = 15,
+    vocal_port_program: int = 79,
+    vocal_port_bank_msb: int = 0,
+    vocal_port_duck_cc7: int = 90,
     device: torch.device | str | None = "auto",
     amp: bool = False,
     amp_dtype: str | None = None,
@@ -894,6 +916,21 @@ def run_stem_separated_transcription(
                 _move_model(current_amt_model, "cpu")
         del waveform
 
+        # 4.4 ボーカルステムだけ faster-whisper で歌詞を起こし、Lyric メタとして書き込む。
+        if transcribe_lyrics and "vocal" in stem_name.lower():
+            try:
+                print(f"[WhisperLyrics] Running whisper on {stem_name} ...")
+                add_whisper_lyrics_to_vocals_midi(
+                    vocals_wav_path=stem_path,
+                    stem_midi_path=output_midi,
+                    language=whisper_lyrics_language,
+                    lyrics_confidence_threshold=lyrics_confidence_threshold,
+                    model_size=whisper_model_size,
+                    target_track_name="vocals",
+                )
+            except Exception as err:
+                print(f"Warning: lyric transcription skipped due to error: {err}")
+
     if not stem_midi_paths:
         raise RuntimeError("No stem MIDI files were generated")
 
@@ -1101,6 +1138,30 @@ def run_stem_separated_transcription(
                 # 戻り後に空きメモリを解放するだけで GPU 上から消える。
                 torch.cuda.empty_cache()
 
+    # 6.5 (optional) ボーカルを port 1 のハーモニクス MIDI として書き出す。
+    vocal_port_midi_path: Path | None = None
+    if vocal_port:
+        vocals_wav = next(
+            (Path(path) for name, path in stems.items() if "vocal" in name.lower()),
+            None,
+        )
+        if vocals_wav is None or not vocals_wav.exists():
+            print("[vocal-port] vocals stem not found, skipped")
+        else:
+            try:
+                from instrument_agnostic_amt.vocal_port import add_vocal_port
+
+                vocal_port_midi_path = add_vocal_port(
+                    merged_midi_path,
+                    vocals_wav,
+                    n_components=vocal_port_components,
+                    program=vocal_port_program,
+                    bank_msb=vocal_port_bank_msb,
+                    duck_cc7=vocal_port_duck_cc7,
+                )
+            except Exception as err:
+                print(f"Warning: vocal port skipped due to error: {err}")
+
     # 7. 中間の分離 wav を削除。
     if cleanup_separated_stems:
         shutil.rmtree(stem_dir, ignore_errors=True)
@@ -1110,12 +1171,14 @@ def run_stem_separated_transcription(
         "output_root": str(run_root),
         "stem_dir": str(stem_dir),
         "stem_midi_dir": str(stem_midi_dir),
-        "merged_midi_path": str(merged_midi_path),
+        "merged_midi_path": str(vocal_port_midi_path or merged_midi_path),
         "stem_count": len(stems),
         "transcribed_stem_count": len(song_midi_paths),
         "instruments_refined": instruments_refined,
         "velocity_predicted": predict_velocity,
         "beat_chord_predicted": predict_beat_chord,
+        "lyrics_transcribed": transcribe_lyrics,
+        "vocal_port": vocal_port_midi_path is not None,
         # 実際に使ったビートの推定元。SheetSage2-Refined が失敗して戻った場合は "tsumugi"。
         "beat_source": used_beat_source,
         "semi_crf_backend": bundle["semi_crf_backend"],
