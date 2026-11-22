@@ -3,10 +3,10 @@
 
 Each frame of the vocals stem goes through:
 
-1. YIN on a 64 ms evidence window, which gives a periodicity curve and an
-   aperiodicity value.
-2. A peak-based spectral estimate, which decides the octave: the lowest strong
-   peak that is not an octave above another strong peak wins.
+1. YIN on a 64 ms evidence window, which gives a periodicity curve.
+2. A peak-based spectral estimate, which decides the octave. When a melody /
+   harmony reference is supplied, strong peaks are scored against it so f0 is
+   seeded on the melody pitch rather than a harmony note or wrong octave.
 3. The two are multiplied and normalized to a candidate grid of 8 cents steps.
 4. Viterbi tracking over the whole stem with a smoothness prior, so the chosen
    f0 follows the previous frame instead of jumping between candidates.
@@ -155,20 +155,31 @@ def _yin_evidence(x: np.ndarray, fs: float, candidates: np.ndarray):
     tau_max = min(n - 2, int(np.ceil(fs / float(candidates.min()))) + 1)
     tau_min = max(2, int(np.floor(fs / float(candidates.max()))))
     if tau_max <= tau_min + 1 or n - tau_max < 8:
-        return np.zeros(candidates.size), 1.0
+        return np.zeros(candidates.size)
     cmnd = _cumulative_mean_norm_diff(x, tau_max)
     lags = np.clip(fs / np.maximum(candidates, 1e-6), 1, tau_max)
     ev = 1.0 - np.interp(lags, np.arange(tau_max + 1), cmnd)
-    aper = float(cmnd[tau_min:tau_max + 1].min())
-    return np.clip(ev, 0.0, 1.0), aper
+    return np.clip(ev, 0.0, 1.0)
 
 
 def _dft_evidence(x: np.ndarray, fs: float, candidates: np.ndarray,
                   band_lo: float = 60.0, band_hi: float = 1000.0,
                   prom_db: float = 8.0, prom_look: float = 0.25,
                   sigma_oct: float = 0.12, octave_rel_db: float = 12.0,
-                  strong_rel_db: float = 12.0):
-    """Evidence around the lowest strong spectral peak, with octave fallback."""
+                  strong_rel_db: float = 12.0,
+                  guide_hz: float = 0.0, neg_guide_hz: float = 0.0,
+                  attract_st: float = 2.0, repel_st: float = 2.0,
+                  attract_db: float = 60.0, repel_db: float = 60.0):
+    """Evidence around a strong spectral peak, with octave fallback.
+
+    Blind mode (no guide/neg_guide): the lowest strong peak wins, then folds
+    down in octaves while a strong sub-octave peak exists.
+
+    Guided mode: every strong peak (plus sub-octave candidates) is scored by its
+    prominence PLUS a Gaussian attract field around the melody note MINUS a
+    Gaussian repel field around the harmony note. The peak nearest melody and
+    away from harmony wins even when it is not the loudest.
+    """
     if x.size < 32 or not np.any(x):
         return np.zeros(candidates.size), 0.0
     n_fft = 1 << int(np.ceil(np.log2(max(x.size * 8, 4096))))
@@ -198,24 +209,54 @@ def _dft_evidence(x: np.ndarray, fs: float, candidates: np.ndarray,
     if idx.size == 0:
         return np.zeros(candidates.size), 0.0
     vmax = float(db[idx].max())
-    c = 0.0
+
+    # All strong peaks, in ascending frequency order (idx is sorted).
+    raw: list[tuple[float, float]] = []  # (freq_hz, prominence_db)
     for k in idx:
         if k <= 0 or k >= spec.size - 1:
             continue
         if not (spec[k] > spec[k - 1] and spec[k] >= spec[k + 1]):
             continue
-        if peak_prom(float(freqs[k])) >= prom_db and db[k] >= vmax - strong_rel_db:
-            c = float(freqs[k])
-            break
-    if c <= 0:
+        pr = peak_prom(float(freqs[k]))
+        if pr >= prom_db and db[k] >= vmax - strong_rel_db:
+            raw.append((float(freqs[k]), pr))
+    if not raw:
         return np.zeros(candidates.size), 0.0
 
-    while c / 2.0 >= band_lo:
-        p_cur = peak_prom(c)
-        p_half = peak_prom(c / 2.0)
-        if p_half < prom_db or p_half < p_cur - octave_rel_db:
-            break
-        c /= 2.0
+    guided = guide_hz > 0 or neg_guide_hz > 0
+    if not guided:
+        # Blind: lowest strong peak, then fold down while a strong sub-octave exists.
+        c = raw[0][0]
+        while c / 2.0 >= band_lo:
+            p_cur = peak_prom(c)
+            p_half = peak_prom(c / 2.0)
+            if p_half < prom_db or p_half < p_cur - octave_rel_db:
+                break
+            c /= 2.0
+    else:
+        # Guided: score every peak and its sub-octave candidates.
+        pool: list[tuple[float, float]] = []  # (freq_hz, prominence_db)
+        for peak, pr in raw:
+            cur, cur_pr = peak, pr
+            pool.append((cur, cur_pr))
+            while cur / 2.0 >= band_lo:
+                p_half = peak_prom(cur / 2.0)
+                if p_half < prom_db or p_half < peak_prom(cur) - octave_rel_db:
+                    break
+                cur /= 2.0
+                pool.append((cur, p_half))
+
+        def score(freq: float, pr: float) -> float:
+            s = pr  # loudness / prominence is the base evidence
+            if guide_hz > 0:  # positive sample: pull peaks onto melody
+                d_mel = 12.0 * np.log2(max(freq, 1e-9) / guide_hz)
+                s += attract_db * np.exp(-0.5 * (d_mel / max(attract_st, 1e-3)) ** 2)
+            if neg_guide_hz > 0:  # negative sample: push peaks off harmony
+                d_harm = 12.0 * np.log2(max(freq, 1e-9) / neg_guide_hz)
+                s -= repel_db * np.exp(-0.5 * (d_harm / max(repel_st, 1e-3)) ** 2)
+            return s
+
+        c = max(pool, key=lambda item: score(item[0], item[1]))[0]
 
     d = np.log2(np.maximum(candidates, 1e-9) / c)
     return np.exp(-0.5 * (d / max(sigma_oct, 1e-3)) ** 2), c
@@ -517,7 +558,11 @@ def _proj_length(f0: float) -> int:
     return max(4, (length // 4) * 4)
 
 
-def analyze_array(x: np.ndarray, sample_rate: int = SAMPLE_RATE) -> VocalTrack:
+def analyze_array(x: np.ndarray, sample_rate: int = SAMPLE_RATE,
+                  guide: np.ndarray | None = None,
+                  neg_guide: np.ndarray | None = None,
+                  guide_threshold_st: float = 2.0,
+                  neg_tolerance_st: float = 2.0) -> VocalTrack:
     """Analyze one mono waveform and return per-frame vocal parameters."""
     x = np.asarray(x, dtype=np.float64)
     n_samples = x.size
@@ -540,14 +585,23 @@ def analyze_array(x: np.ndarray, sample_rate: int = SAMPLE_RATE) -> VocalTrack:
     evidence = np.zeros((nfr, cand.size))
     voiced_prior = np.zeros(nfr)
     peak_c = np.zeros(nfr)
+    has_ref = guide is not None or neg_guide is not None
     for i in range(nfr):
         if not valid[i]:
             continue
         seg, _ = _window_segment(x, i * hop + win // 2, ev_win)
         sfm = _spectral_flatness(seg, sample_rate)
         voiced_prior[i] = float(np.clip((SFM_VOICED_MAX - sfm) / 0.15, 0.0, 1.0))
-        ev_y, _ = _yin_evidence(seg, sample_rate, cand)
-        ev_d, c = _dft_evidence(seg, sample_rate, cand)
+        ev_y = _yin_evidence(seg, sample_rate, cand)
+        if has_ref:
+            g_hz = float(guide[i]) if guide is not None else 0.0
+            ng_hz = float(neg_guide[i]) if neg_guide is not None else 0.0
+            ev_d, c = _dft_evidence(seg, sample_rate, cand,
+                                    guide_hz=g_hz, neg_guide_hz=ng_hz,
+                                    attract_st=guide_threshold_st,
+                                    repel_st=neg_tolerance_st)
+        else:
+            ev_d, c = _dft_evidence(seg, sample_rate, cand)
         peak_c[i] = c
         ev = _combine(ev_y, ev_d)
         m = float(np.max(ev)) if ev.size else 0.0
@@ -605,8 +659,73 @@ def analyze_array(x: np.ndarray, sample_rate: int = SAMPLE_RATE) -> VocalTrack:
                       sample_rate)
 
 
-def analyze_vocals(wav_path) -> VocalTrack:
-    """Load a wav (any rate, any channel count) and analyze the mono mix."""
+def melody_guide_from_midi(midi_path, n_frames: int, hop_seconds: float,
+                           track_name: str = "melody") -> np.ndarray:
+    """Build a per-frame pitch guide (Hz, 0 = none) from a named MIDI track.
+
+    Note pitches are converted to Hz and held for each note's duration, as a
+    positive (melody) or negative (vocal_harmony) reference for peak selection.
+    Frames without a covering note stay 0.
+    """
+    import mido
+
+    guide = np.zeros(n_frames)
+    mid = mido.MidiFile(str(midi_path))
+    tempo = 500000  # default 120 BPM
+    for msg in mid.tracks[0]:
+        if msg.type == "set_tempo":
+            tempo = msg.tempo
+            break
+    tick2sec = tempo / 1e6 / mid.ticks_per_beat
+
+    mel_tr = None
+    for tr in mid.tracks:
+        if (tr.name or "").strip().lower() == track_name.lower():
+            mel_tr = tr
+            break
+    if mel_tr is None:
+        return guide
+
+    notes: list[list[float]] = []  # [pitch, start_sec, end_sec]
+    t = 0
+    for msg in mel_tr:
+        t += msg.time
+        if msg.type == "note_on" and msg.velocity > 0:
+            notes.append([float(msg.note), t * tick2sec, -1.0])
+        elif (msg.type == "note_off" or
+              (msg.type == "note_on" and msg.velocity == 0)):
+            for n in reversed(notes):
+                if n[2] < 0:
+                    n[2] = t * tick2sec
+                    break
+    for n in notes:
+        if n[2] < 0:
+            n[2] = n[1] + 0.2
+    if not notes:
+        return guide
+
+    for i in range(n_frames):
+        tc = (i + 0.5) * hop_seconds
+        for pit, a, b in notes:
+            if a <= tc < b:
+                guide[i] = 440.0 * 2.0 ** ((pit - 69.0) / 12.0)
+                break
+    return guide
+
+
+def analyze_vocals(wav_path, melody_midi=None,
+                   guide_threshold_st: float = 2.0,
+                   neg_tolerance_st: float = 2.0) -> VocalTrack:
+    """Load a wav (any rate, any channel count) and analyze the mono mix.
+
+    If ``melody_midi`` is given, its melody track is a positive reference and
+    its vocal_harmony track a negative reference. They are applied at the
+    spectral peak-selection stage: among the strong peaks, ones close to melody
+    are preferred and ones close to harmony are penalised, so f0 is seeded on
+    the right peak from the start. No post-hoc snap is applied to the tracked
+    f0, so vibrato and fine pitch movement are preserved. Omit it (default) for
+    fully blind f0.
+    """
     import soundfile as sf
     from scipy.signal import resample_poly
 
@@ -616,4 +735,16 @@ def analyze_vocals(wav_path) -> VocalTrack:
         from math import gcd
         g = gcd(int(sr), SAMPLE_RATE)
         x = resample_poly(x, SAMPLE_RATE // g, int(sr) // g)
-    return analyze_array(x, SAMPLE_RATE)
+    guide = None
+    neg_guide = None
+    if melody_midi is not None:
+        win, hop = WIN_SIZE, HOP_SIZE
+        nfr = _frame_count(x.size, win, hop)
+        hop_s = hop / float(SAMPLE_RATE)
+        guide = melody_guide_from_midi(melody_midi, nfr, hop_s,
+                                       track_name="melody")
+        neg_guide = melody_guide_from_midi(melody_midi, nfr, hop_s,
+                                           track_name="vocal_harmony")
+    return analyze_array(x, SAMPLE_RATE, guide=guide, neg_guide=neg_guide,
+                         guide_threshold_st=guide_threshold_st,
+                         neg_tolerance_st=neg_tolerance_st)

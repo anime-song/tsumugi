@@ -4,7 +4,7 @@
 The vocals stem is analyzed frame by frame (`vocal_pitch`): f0 plus one harmonic
 level curve per frame. The first N harmonics (15 by default) are rendered as
 additive synthesis, one MIDI channel per harmonic on port 1, all with a fixed
-program (bank 8 / program 80).
+program (bank 0 / GM program 80, ocarina).
 
 Mapping rules:
 - RPN 0,0 sets pitch bend range to +-12 semitones at the start of every channel.
@@ -31,12 +31,10 @@ BEND_RANGE_SEMI = 12.0     # pitch bend range set through RPN
 # CC11 gain maps directly to the true harmonic amplitude; no floor, no lift.
 # A floor is deliberately avoided: it would raise weak high harmonics far above
 # their real level and make the top band louder than the fundamental.
-CC_MASTER_GAIN_DB = 0.0    # global level trim for the vocal port; 0.0 = exact
-# measured amplitudes. Raises all port channels equally (keeps harmonic balance).
+CC_MASTER_GAIN_DB = 0.0    # global level trim; 0.0 = exact measured amplitudes
 CC_MASTER_GAIN = 10.0 ** (CC_MASTER_GAIN_DB / 20.0)
 ACCOMPANIMENT_CC7 = 70     # channel volume written to every accompaniment track
 CC_STEP_MIN = 2            # smallest CC11 change worth writing, about 0.7 dB
-SMOOTH_FRAMES = 9          # temporal low-pass width for the level curve, in frames
 CC7_VALUE = 127            # channel volume for the vocal channels
 COMP_GATE_DB = 45.0        # a frame is silent when f0 is 45 dB below its own peak
 MIN_RUN_FRAMES = 2         # shortest note, in frames
@@ -85,27 +83,6 @@ def _build_channel_events(run: dict, ch: int, program: int, bank_msb: int,
     return ev
 
 
-def _smooth_frame_levels(frames: list) -> None:
-    """Low-pass the per-frame levels in place.
-
-    Frames the gate drops become holes; they are bridged by linear interpolation
-    first so the filter never sees the gaps, then only the gated frames are
-    written back. The kernel spans a few frames, well below the vibrato rate.
-    """
-    idx = [i for i, f in enumerate(frames) if f is not None]
-    if len(idx) < 3:
-        return
-    db = np.array([frames[i][1] for i in idx], dtype=np.float64)
-    full = np.interp(np.arange(len(frames)), idx, db)
-    half = SMOOTH_FRAMES // 2
-    if half > 0:
-        taps = np.exp(-0.5 * (np.arange(-half, half + 1) / (0.5 * half)) ** 2)
-        taps /= taps.sum()
-        full = np.convolve(np.pad(full, half, mode="edge"), taps, mode="valid")
-    for i in idx:
-        frames[i] = (frames[i][0], float(full[i]))
-
-
 def _f0_level_db(track, i: int) -> float:
     """Absolute level of the fundamental (k=1) in frame i."""
     f = float(track.f0[i])
@@ -135,10 +112,9 @@ def _component_segments(track, k: int, sec2tick, active: np.ndarray,
                         ref_db: float) -> list[dict]:
     """Note segments of harmonic k, split only where the f0 gate closes.
 
-    Segment boundaries come from `active` (f0 only); abs_db no longer decides
-    silence, it only feeds the per-frame CC11 level curve. CC11 is referenced to
-    the f0 peak (`ref_db`) shared by every harmonic, so a weaker harmonic stays
-    quieter than the fundamental instead of being normalized to its own peak.
+    Segment boundaries come from `active` (f0 only) and the amplitude feeds the
+    per-frame CC11 curve. CC11 is referenced to the f0 peak (`ref_db`) shared by
+    every harmonic, so a weaker harmonic stays quieter than the fundamental.
 
     Returns {'vel': int, 'segs': [(start_tick, end_tick, note, bends, expr)]}.
     """
@@ -159,9 +135,6 @@ def _component_segments(track, k: int, sec2tick, active: np.ndarray,
         rel_db = float(np.interp(np.log2(freq), np.log2(track.centers_h), track.harm_band_db[i]))
         abs_db = float(track.harm_peak_db[i]) + rel_db
         frames.append((freq, abs_db))
-
-    # Faithful mode: no temporal smoothing of the level curve. CC11 carries the
-    # measured per-frame harmonic amplitude unchanged.
 
     segs = []
     i = 0
@@ -202,21 +175,18 @@ def _component_segments(track, k: int, sec2tick, active: np.ndarray,
     if not segs:
         return {}
 
-    # Velocity stays at 127; loudness is carried by the CC curve. Every channel
-    # uses the same f0 reference passed in, so harmonic balance is preserved:
-    # a quiet upper harmonic stays quiet instead of being lifted to full scale.
+    # Velocity stays at 127; loudness is carried by the CC11 curve alone.
     out_segs = []
     last_val = None
     for sg in segs:
         expr_t = []
         for idx, db in sg["frames"]:
-            # True linear amplitude of this harmonic relative to the f0 peak.
-            # No per-channel floor: the ONLY scaling is a single global gain
-            # shared by every channel, so the harmonic balance is untouched.
+            # Linear amplitude of this harmonic relative to the shared f0 peak,
+            # with a single global gain. No per-channel floor or normalisation,
+            # so the measured harmonic balance is preserved.
             ratio = (10.0 ** ((db - ref_db) / 20.0)) * CC_MASTER_GAIN
-            # GM2 volume curve: amplitude = (cc / 127) ** 2, so cc = 127 * sqrt(amp).
-            # The sqrt is the physical inverse of the synth curve, not a shaping step:
-            # it makes the played-back amplitude equal the measured amplitude.
+            # GM2 curve: amplitude = (cc / 127) ** 2, so cc = 127 * sqrt(amp).
+            # The sqrt is the physical inverse of the synth curve, not shaping.
             val = int(np.clip(round(127.0 * np.sqrt(ratio)), 0, 127))
             # The curve runs across segment boundaries, so a change below the
             # audible step is dropped instead of being rewritten every frame.
@@ -260,15 +230,24 @@ def add_vocal_port(
     bank_msb: int = BANK_MSB_DEFAULT,
     volume_cc: int = 11,
     accompaniment_cc7: int | None = ACCOMPANIMENT_CC7,
+    melody_midi: str | Path | None = None,
+    guide_threshold_st: float = 2.0,
+    neg_tolerance_st: float = 2.0,
 ) -> Path:
-    """Append a port-1 vocal track to midi_path and write out_path (*_vocalport.mid)."""
+    """Append a port-1 vocal track to midi_path and write out_path (*_vocalport.mid).
+
+    If ``melody_midi`` is given, its melody (positive) and vocal_harmony
+    (negative) tracks disambiguate f0 on harmony passages. Omit it for blind f0.
+    """
     midi_path = Path(midi_path)
     if out_path is None:
         out_path = midi_path.with_name(midi_path.stem + "_vocalport.mid")
     out_path = Path(out_path)
 
     print(f"[vocal-port] analyzing {vocals_wav} ...")
-    track = analyze_vocals(vocals_wav)
+    track = analyze_vocals(vocals_wav, melody_midi=melody_midi,
+                           guide_threshold_st=guide_threshold_st,
+                           neg_tolerance_st=neg_tolerance_st)
     nfr = track.n_frames
     hop = track.hop_size / track.sample_rate
     print(f"[vocal-port] {nfr} frames ({nfr * hop:.1f}s)")
