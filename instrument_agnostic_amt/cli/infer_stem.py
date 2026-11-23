@@ -25,8 +25,13 @@ from instrument_agnostic_amt.beat_chord.cli.infer import (
 )
 from instrument_agnostic_amt.beat_chord.sheetsage import (
     SheetSageBeatGrid,
+    load_sheetsage_melody_model,
     load_sheetsage_model,
     predict_sheetsage_beat_grid,
+    predict_sheetsage_beats_and_melody,
+)
+from instrument_agnostic_amt.beat_chord.vocal_melody_fusion import (
+    fuse_sheetsage_melody_with_tsumugi_vocals,
 )
 from instrument_agnostic_amt.instrument_refinement.cli.infer import (
     ensure_refinement_checkpoint,
@@ -89,6 +94,12 @@ REFINEMENT_EXCLUDED_STEM_GROUPS = ("drums", "vocals")
 # tsumugi:    beat/chord モデル (MIDI ロール + 元音源のテンポ解析)。
 # sheetsage2: SheetSage2-Refined のデコーダーなしビートトラッカー (元音源を直接聴く)。既定。
 BEAT_SOURCES = ("tsumugi", "sheetsage2")
+
+# ボーカル主旋律の推定元。
+# tsumugi:    分離 vocals ステムから tsumugi (vocal_harmony_v1_5) のみで採譜する。
+# sheetsage2: SheetSage2-Refined 0.5.2+ の HeadMelody を vocals ステム音声でゲートし、
+#             tsumugi の主旋律／ハモリとアンカー融合する。既定。
+VOCAL_MELODY_SOURCES = ("tsumugi", "sheetsage2")
 
 
 def _current_model_device(model: torch.nn.Module) -> torch.device:
@@ -541,6 +552,28 @@ def get_sheetsage_model(
     return STEM_PIPELINE_CACHE[cache_key][0]
 
 
+def get_sheetsage_melody_model(
+    device_preference: torch.device | str | None = None,
+    *,
+    shared_encoder: object | None = None,
+) -> object:
+    """SheetSage2-Refined 0.5.2+ のデコーダーなしメロディトラッカーを読み込み、セッション中は再利用する。
+
+    `shared_encoder` にビートトラッカー側の MERTEncoder を渡すと、2.7 GB のエンコーダを
+    二重ロードせず 8 MB の melody head だけを追加読み込みして共有する。
+    """
+    device = resolve_device(device_preference)
+    cache_key = ("sheetsage2_melody", str(device), "shared" if shared_encoder is not None else "standalone")
+    if cache_key not in STEM_PIPELINE_CACHE:
+        print(f"Loading SheetSage2-Refined melody head on {device} ...")
+        STEM_PIPELINE_CACHE[cache_key] = (
+            load_sheetsage_melody_model(device, shared_encoder=shared_encoder),
+        )
+    else:
+        print(f"Reusing cached SheetSage2-Refined melody head on {device} ...")
+    return STEM_PIPELINE_CACHE[cache_key][0]
+
+
 def _move_sheetsage_model(model: object, target: torch.device | str) -> None:
     """SheetSage2-Refined のビートトラッカーのエンコーダーと bar head をまとめて target へ移す。
 
@@ -728,6 +761,7 @@ def run_stem_separated_transcription(
     beat_chord_checkpoint_path: Path | str | None = None,
     beat_chord_use_audio: bool = True,
     beat_source: str = "sheetsage2",
+    vocal_melody_source: str = "sheetsage2",
     merge_onset_ms: float = 20.0,
     device: torch.device | str | None = "auto",
     amp: bool = False,
@@ -748,6 +782,10 @@ def run_stem_separated_transcription(
         raise FileNotFoundError(f"Audio file not found: {audio_file}")
     if beat_source not in BEAT_SOURCES:
         raise ValueError(f"beat_source must be one of {BEAT_SOURCES}, got {beat_source!r}")
+    if vocal_melody_source not in VOCAL_MELODY_SOURCES:
+        raise ValueError(
+            f"vocal_melody_source must be one of {VOCAL_MELODY_SOURCES}, got {vocal_melody_source!r}"
+        )
     normalized_render_compare_speed = str(render_compare_speed).strip().lower()
     if normalized_render_compare_speed not in RENDER_COMPARE_SPEED_PRESETS:
         raise ValueError(
@@ -984,6 +1022,142 @@ def run_stem_separated_transcription(
     if not stem_midi_paths:
         raise RuntimeError("No stem MIDI files were generated")
 
+    # Render & Compare 系およびボーカル融合で共通利用するリサンプリング済み波形キャッシュ。
+    # 同一 sample_rate（例: balanced の 16 kHz）で元ステム WAV を何度もディスク読込・CPU リサンプリングする無駄を省く。
+    render_compare_stereo_cache: dict[tuple[str, int], np.ndarray] = {}
+
+    def _get_cached_stereo_audio(audio_key: str, path: Path | str, target_sample_rate: int) -> np.ndarray:
+        cache_key = (str(audio_key).lower(), int(target_sample_rate))
+        cached = render_compare_stereo_cache.get(cache_key)
+        if cached is not None:
+            return cached
+        from instrument_agnostic_amt.velocity.render_compare_velocity import _load_stereo_audio
+
+        loaded = _load_stereo_audio(Path(path), target_sample_rate=int(target_sample_rate))
+        render_compare_stereo_cache[cache_key] = loaded
+        return loaded
+
+    def _preloaded_mono_stems(target_sample_rate: int) -> dict[str, np.ndarray]:
+        return {
+            str(stem_name).lower(): _get_cached_stereo_audio(stem_name, stem_path, target_sample_rate)
+            .mean(axis=0)
+            .astype(np.float32, copy=False)
+            for stem_name, stem_path in stems.items()
+            if Path(stem_path).is_file()
+        }
+
+    def _preloaded_stereo_stems(target_sample_rate: int) -> dict[str, np.ndarray]:
+        return {
+            str(stem_name).lower(): _get_cached_stereo_audio(stem_name, stem_path, target_sample_rate)
+            for stem_name, stem_path in stems.items()
+            if Path(stem_path).is_file()
+        }
+
+    # 4.2 (任意) SheetSage2-Refined 0.5.2+ によるボーカル主旋律・ハモリ融合（および共有ビート推定）。
+    #     vocals ステムが存在し vocal_melody_source="sheetsage2" のとき、単一 MERTEncoder パスで
+    #     メロディ（と、必要ならビート格子も同時に）を推定し、分離ボーカル音声ゲート＋アンカー融合を行う。
+    precomputed_sheetsage_beat_grid: SheetSageBeatGrid | None = None
+    vocal_melody_fusion_report: dict[str, object] | None = None
+    vocal_stem_name = next(
+        (name for name in sorted(stems) if inference_stem_group(name) == "vocals"),
+        None,
+    )
+    used_vocal_melody_source = "tsumugi"
+    needs_sheetsage_melody = bool(
+        vocal_melody_source == "sheetsage2"
+        and vocal_stem_name is not None
+        and Path(stems[vocal_stem_name]).is_file()
+    )
+    needs_sheetsage_beats_with_melody = bool(
+        beat_source == "sheetsage2" and (needs_quantize_rc or predict_beat_chord)
+    )
+    if needs_sheetsage_melody and vocal_stem_name is not None:
+        sheetsage_beat_model = None
+        sheetsage_melody_model = None
+        try:
+            print(
+                "Predicting vocal melody"
+                + (" and beats" if needs_sheetsage_beats_with_melody else "")
+                + " with SheetSage2-Refined..."
+            )
+            storage_pref = "cpu" if low_vram_mode else device
+            if needs_sheetsage_beats_with_melody:
+                sheetsage_beat_model = get_sheetsage_model(device_preference=storage_pref)
+                sheetsage_melody_model = get_sheetsage_melody_model(
+                    device_preference=storage_pref,
+                    shared_encoder=sheetsage_beat_model.encoder,
+                )
+                if low_vram_mode:
+                    _move_sheetsage_model(sheetsage_beat_model, device)
+                    _move_sheetsage_model(sheetsage_melody_model, device)
+            else:
+                sheetsage_melody_model = get_sheetsage_melody_model(device_preference=storage_pref)
+                if low_vram_mode:
+                    _move_sheetsage_model(sheetsage_melody_model, device)
+
+            source_waveform, source_sample_rate = _load_audio_channels_first(audio_file)
+            (
+                precomputed_sheetsage_beat_grid,
+                sheetsage_beats,
+                sheetsage_melody_prediction,
+                sheetsage_raw_melody,
+            ) = predict_sheetsage_beats_and_melody(
+                sheetsage_beat_model,
+                sheetsage_melody_model,
+                source_waveform.mean(axis=0),
+                source_sample_rate,
+            )
+            del source_waveform
+
+            if sheetsage_beats is not None:
+                sheetsage_beats_json_path = merged_dir / f"{audio_file.stem}_sheetsage2.beats.json"
+                sheetsage_beats_json_path.write_text(
+                    json.dumps({"audio": str(audio_file)} | sheetsage_beats, ensure_ascii=False),
+                    encoding="utf-8",
+                )
+            if sheetsage_raw_melody is not None:
+                sheetsage_melody_json_path = merged_dir / f"{audio_file.stem}_sheetsage2.melody.json"
+                sheetsage_melody_json_path.write_text(
+                    json.dumps({"audio": str(audio_file)} | sheetsage_raw_melody, ensure_ascii=False),
+                    encoding="utf-8",
+                )
+
+            if sheetsage_melody_prediction is not None:
+                fused_vocal_midi_path = stem_midi_dir / f"{audio_file.stem}_{vocal_stem_name}_fused.mid"
+                vocal_mono_16k = _get_cached_stereo_audio(vocal_stem_name, stems[vocal_stem_name], 16_000).mean(
+                    axis=0
+                )
+                mix_mono_16k = _get_cached_stereo_audio("__full_mix__", audio_file, 16_000).mean(axis=0)
+                _, vocal_melody_fusion_report = fuse_sheetsage_melody_with_tsumugi_vocals(
+                    sheetsage_melody_prediction,
+                    tsumugi_vocal_midi_path=stem_midi_paths.get(vocal_stem_name),
+                    output_midi_path=fused_vocal_midi_path,
+                    preloaded_vocal_mono=vocal_mono_16k,
+                    preloaded_mix_mono=mix_mono_16k,
+                )
+                stem_midi_paths[vocal_stem_name] = fused_vocal_midi_path
+                used_vocal_melody_source = "sheetsage2"
+                print(
+                    "Fused SheetSage2 vocal melody with tsumugi harmony "
+                    f"(instrumental={vocal_melody_fusion_report['is_instrumental_song']}, "
+                    f"melody={vocal_melody_fusion_report['final_melody_notes']}, "
+                    f"harmony={vocal_melody_fusion_report['final_harmony_notes']}, "
+                    f"rejected_inst={vocal_melody_fusion_report['sheetsage_rejected_instrumental_notes']}, "
+                    f"promoted_harm={vocal_melody_fusion_report['tsumugi_harmony_promoted_from_melody']})"
+                )
+        except Exception as err:
+            print(
+                "Warning: SheetSage2-Refined vocal melody fusion skipped due to error; "
+                f"falling back to tsumugi vocals: {err}"
+            )
+            used_vocal_melody_source = "tsumugi"
+        finally:
+            if low_vram_mode:
+                if sheetsage_melody_model is not None:
+                    _move_sheetsage_model(sheetsage_melody_model, "cpu")
+                if sheetsage_beat_model is not None:
+                    _move_sheetsage_model(sheetsage_beat_model, "cpu")
+
     # 4.5 Instrument Refinement でステム内の楽器ラベルを付け直す。
     instruments_refined = False
     effective_refinement_rc_config = refinement_render_compare_config
@@ -1039,37 +1213,6 @@ def run_stem_separated_transcription(
             if not predict_velocity and waveform_cache is not None:
                 waveform_cache.clear()
 
-    # Render & Compare 3 段（defragment / quantize / velocity）で共通利用するリサンプリング済み波形キャッシュ。
-    # 同一 sample_rate（例: balanced の 16 kHz）で元ステム WAV を何度もディスク読込・CPU リサンプリングする無駄を省く。
-    render_compare_stereo_cache: dict[tuple[str, int], np.ndarray] = {}
-
-    def _get_cached_stereo_audio(audio_key: str, path: Path | str, target_sample_rate: int) -> np.ndarray:
-        cache_key = (str(audio_key).lower(), int(target_sample_rate))
-        cached = render_compare_stereo_cache.get(cache_key)
-        if cached is not None:
-            return cached
-        from instrument_agnostic_amt.velocity.render_compare_velocity import _load_stereo_audio
-
-        loaded = _load_stereo_audio(Path(path), target_sample_rate=int(target_sample_rate))
-        render_compare_stereo_cache[cache_key] = loaded
-        return loaded
-
-    def _preloaded_mono_stems(target_sample_rate: int) -> dict[str, np.ndarray]:
-        return {
-            str(stem_name).lower(): _get_cached_stereo_audio(stem_name, stem_path, target_sample_rate)
-            .mean(axis=0)
-            .astype(np.float32, copy=False)
-            for stem_name, stem_path in stems.items()
-            if Path(stem_path).is_file()
-        }
-
-    def _preloaded_stereo_stems(target_sample_rate: int) -> dict[str, np.ndarray]:
-        return {
-            str(stem_name).lower(): _get_cached_stereo_audio(stem_name, stem_path, target_sample_rate)
-            for stem_name, stem_path in stems.items()
-            if Path(stem_path).is_file()
-        }
-
     # 4.7 (任意) Render & Compare 過剰分割ノート結合（持続系オーケストラ楽器の細切れ防止）。
     defragmented_with_render_compare = False
     defragmented_stem_midi_dir = run_root / "defragmented_stem_midis"
@@ -1108,7 +1251,6 @@ def run_stem_separated_transcription(
     # 4.8 (任意) Render & Compare 型ビート量子化:
     #     SheetSage2-Refined（または tsumugi）でビート格子を先に取得し、オンセットズレを各ステム単位で補正する。
     #     位相アラインメント済みのビート格子は後段の Step 6.5 (Beat/Chord テンポマップ書き出し) でも再利用する。
-    precomputed_sheetsage_beat_grid: SheetSageBeatGrid | None = None
     quantized_with_render_compare = False
     quantized_stem_midi_dir = run_root / "quantized_stem_midis"
     effective_quantize_config = quantize_render_compare_config
@@ -1125,7 +1267,13 @@ def run_stem_separated_transcription(
         sheetsage_model = None
         beat_grid_input: BeatGridInput | None = None
         try:
-            if beat_source == "sheetsage2":
+            if precomputed_sheetsage_beat_grid is not None:
+                beat_grid_input = BeatGridInput(
+                    beat_times=precomputed_sheetsage_beat_grid.beat_times,
+                    downbeat_times=precomputed_sheetsage_beat_grid.downbeat_times,
+                    meter_segments=precomputed_sheetsage_beat_grid.meter_segments,
+                )
+            elif beat_source == "sheetsage2":
                 try:
                     print("Predicting beats with SheetSage2-Refined for Render & Compare quantization...")
                     if low_vram_mode:
@@ -1464,10 +1612,13 @@ def run_stem_separated_transcription(
         "instruments_refined": instruments_refined,
         "velocity_predicted": predict_velocity,
         "beat_chord_predicted": predict_beat_chord,
-        # 実際に使ったビートの推定元。SheetSage2-Refined が失敗して戻った場合は "tsumugi"。
+        # 実際に使ったビートおよびボーカル主旋律の推定元。SheetSage2-Refined が失敗して戻った場合は "tsumugi"。
         "beat_source": used_beat_source,
+        "vocal_melody_source": used_vocal_melody_source,
         "semi_crf_backend": bundle["semi_crf_backend"],
     }
+    if vocal_melody_fusion_report is not None:
+        result["vocal_melody_fusion"] = vocal_melody_fusion_report
     if instruments_refined:
         result["refined_stem_midi_dir"] = str(refined_stem_midi_dir)
         result["refined_with_render_compare"] = effective_refinement_rc_config is not None

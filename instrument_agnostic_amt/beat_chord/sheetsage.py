@@ -23,7 +23,9 @@ SheetSage2-Refined のコードは MIT、重みは CC BY-NC 4.0 (非商用) で�
 
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, Mapping
 
 import numpy as np
@@ -40,6 +42,29 @@ class SheetSageBeatGrid:
     meter_segments: tuple[MeterSegmentSpec, ...]
 
 
+@dataclass(frozen=True)
+class SheetSageMelodyNote:
+    """SheetSage2-Refined (HeadMelody) が出力する 1 音符と歌唱確率。"""
+
+    start_seconds: float
+    end_seconds: float
+    pitch: int
+    track: int  # 0: sung (歌唱), 1: played (楽器メロディ)
+    vocal_probability: float
+    steps: int | None = None
+    position_in_beat: int | None = None
+
+
+@dataclass(frozen=True)
+class SheetSageMelodyPrediction:
+    """SheetSage2-Refined (HeadMelody) による曲全体のメロディ推定結果。"""
+
+    duration_seconds: float
+    notes: tuple[SheetSageMelodyNote, ...]
+    vocal_probabilities: np.ndarray  # [num_frames] float32 (25 Hz)
+    frame_rate: float = 25.0
+
+
 def load_sheetsage_model(device: torch.device | str) -> Any:
     """SheetSage2-Refined のビートトラッカーを ``device`` に読み込む。
 
@@ -50,11 +75,221 @@ def load_sheetsage_model(device: torch.device | str) -> Any:
         from sheetsage2_refined.beats import HeadBeats
     except ImportError as error:
         raise ImportError(
-            "SheetSage2-Refined (0.2.0 or later) is not installed. Install it with "
+            "SheetSage2-Refined (0.5.2 or later) is not installed. Install it with "
             "`uv sync --extra sheetsage` or "
             "`pip install git+https://github.com/anime-song/SheetSage2-Refined`."
         ) from error
     return HeadBeats.load(device=str(device))
+
+
+def load_sheetsage_melody_model(
+    device: torch.device | str,
+    *,
+    shared_encoder: Any | None = None,
+) -> Any:
+    """SheetSage2-Refined 0.5.2+ のデコーダーなしメロディトラッカー (HeadMelody) を読み込む。
+
+    ``shared_encoder`` に読み込み済み ``HeadBeats.encoder`` を渡すと、約 2.7 GB の
+    MERTEncoder 重みを二重ロードせず 8 MB の melody head のみを追加ロードして共有する。
+    """
+    try:
+        from sheetsage2_refined.heads import BeatInformed, load_head
+        from sheetsage2_refined.melody import HeadMelody, beat_head_files
+        from sheetsage2_refined.pipeline import DEFAULT_MODEL, model_folder
+    except ImportError as error:
+        raise ImportError(
+            "SheetSage2-Refined 0.5.2+ (with sheetsage2_refined.melody.HeadMelody) is not installed. "
+            "Install or upgrade it with `uv sync --extra sheetsage`."
+        ) from error
+
+    target_device = torch.device(device)
+    if shared_encoder is None:
+        return HeadMelody.load(device=str(target_device))
+
+    def _melody_head_only_files(config: Mapping[str, Any]) -> list[str]:
+        melody_section = config.get("melody_tracker") or {}
+        if not melody_section.get("head"):
+            raise ValueError("This SheetSage2-Refined model has no melody_tracker.head")
+        return [str(melody_section["head"]), *beat_head_files(dict(config))]
+
+    folder = model_folder(DEFAULT_MODEL, None, _melody_head_only_files)
+    config = json.loads((folder / "config.json").read_text(encoding="utf-8"))
+    melody_section = config.get("melody_tracker") or {}
+    melody_head_path = folder / str(melody_section["head"])
+    beat_head_candidates = beat_head_files(config)
+    beat_head_path = folder / str(beat_head_candidates[0]) if beat_head_candidates else None
+    decoding_options = dict(melody_section.get("decoding") or {})
+
+    melody_head = load_head(Path(melody_head_path), target_device)
+    is_line_head = melody_head.line is not None
+    if melody_head.extra is not None:
+        if beat_head_path is None:
+            raise ValueError("Beat-informed melody head requires melody_tracker.beat_head")
+        melody_head = BeatInformed(load_head(Path(beat_head_path), target_device), melody_head).eval()
+
+    return HeadMelody(shared_encoder, melody_head, target_device, is_line_head, **decoding_options)
+
+
+def _resample_waveform_for_encoder(
+    waveform: np.ndarray | torch.Tensor,
+    sample_rate: int,
+    target_sample_rate: int,
+) -> tuple[torch.Tensor, float]:
+    """モノラル波形をエンコーダ規定レート (24 kHz) の float32 テンソルへ揃える。"""
+    wave = torch.as_tensor(np.asarray(waveform, dtype=np.float32))
+    if wave.ndim > 1:
+        wave = wave.mean(dim=0)
+    if int(sample_rate) != int(target_sample_rate):
+        import torchaudio
+
+        wave = torchaudio.functional.resample(wave, int(sample_rate), int(target_sample_rate))
+    duration_seconds = float(len(wave)) / float(target_sample_rate)
+    return wave, duration_seconds
+
+
+def _build_melody_prediction_from_probabilities(
+    melody_model: Any,
+    melody_probabilities: Mapping[str, np.ndarray],
+    duration_seconds: float,
+) -> tuple[SheetSageMelodyPrediction, dict[str, Any]]:
+    """HeadMelody のフレーム確率からノート列とノート別歌唱確率を構築する。"""
+    try:
+        from sheetsage2_refined.heads import FRAME_RATE
+
+        frame_rate = float(FRAME_RATE)
+    except ImportError:
+        frame_rate = 25.0
+
+    raw_notes = melody_model.notes(dict(melody_probabilities))
+    vocal_probabilities = np.asarray(
+        melody_probabilities.get("melody_vocal", np.ones(1, dtype=np.float32)),
+        dtype=np.float32,
+    )
+    frame_count = int(vocal_probabilities.size)
+
+    structured_notes: list[SheetSageMelodyNote] = []
+    for raw_note in raw_notes:
+        start_seconds = float(raw_note["start"])
+        end_seconds = max(start_seconds + 0.01, float(raw_note["end"]))
+        start_frame = max(0, min(frame_count - 1, int(round(start_seconds * frame_rate))))
+        end_frame = min(frame_count, max(start_frame + 1, int(round(end_seconds * frame_rate))))
+        note_vocal_probability = (
+            float(vocal_probabilities[start_frame:end_frame].mean())
+            if frame_count > 0
+            else (1.0 if int(raw_note.get("track", 0)) == 0 else 0.0)
+        )
+        structured_notes.append(
+            SheetSageMelodyNote(
+                start_seconds=start_seconds,
+                end_seconds=end_seconds,
+                pitch=int(raw_note["pitch"]),
+                track=int(raw_note.get("track", 0)),
+                vocal_probability=note_vocal_probability,
+                steps=int(raw_note["steps"]) if "steps" in raw_note else None,
+                position_in_beat=int(raw_note["pos"]) if "pos" in raw_note else None,
+            )
+        )
+
+    prediction = SheetSageMelodyPrediction(
+        duration_seconds=duration_seconds,
+        notes=tuple(structured_notes),
+        vocal_probabilities=vocal_probabilities,
+        frame_rate=frame_rate,
+    )
+    raw_result = {"duration": duration_seconds, "notes": raw_notes}
+    return prediction, raw_result
+
+
+@torch.no_grad()
+def predict_sheetsage_beats_and_melody(
+    beat_model: Any | None,
+    melody_model: Any | None,
+    waveform: np.ndarray | torch.Tensor,
+    sample_rate: int,
+) -> tuple[
+    SheetSageBeatGrid | None,
+    dict[str, Any] | None,
+    SheetSageMelodyPrediction | None,
+    dict[str, Any] | None,
+]:
+    """共有 MERTEncoder を 1 回だけ走査し、ビート格子とメロディを同時に推定する。
+
+    `beat_model` と `melody_model` の片方だけ渡した場合もそのまま動作する。
+    両方渡した場合はエンコーダの窓特徴 ``states`` を各ヘッドへ流用するため、
+    追加 VRAM なし・ほぼ追加計算時間なしでビートとメロディを同時取得できる。
+    """
+    if beat_model is None and melody_model is None:
+        return None, None, None, None
+
+    primary_model = beat_model if beat_model is not None else melody_model
+    encoder = primary_model.encoder
+    model_rate = int(encoder.config.sample_rate)
+    device = torch.device(primary_model.device)
+    wave, duration_seconds = _resample_waveform_for_encoder(waveform, sample_rate, model_rate)
+
+    # 両モデルが同一エンコーダを共有する場合は encode_windows を 1 パスで済ませる。
+    if beat_model is not None and melody_model is not None and beat_model.encoder is melody_model.encoder:
+        from sheetsage2_refined.beats import encode_windows
+        from sheetsage2_refined.heads import CHUNK, LINE, OFFSETS
+
+        beat_window_outputs: list[dict[str, torch.Tensor]] = []
+        melody_window_outputs: list[dict[str, torch.Tensor]] = []
+        for states, keep in encode_windows(encoder, wave, device):
+            beat_window_outputs.append({key: value[:, :keep] for key, value in beat_model.head(states, CHUNK).items()})
+            melody_window_outputs.append(
+                {key: value[:, :keep] for key, value in melody_model.head(states, CHUNK).items()}
+            )
+
+        beat_logits = {
+            key: torch.cat([window_out[key] for window_out in beat_window_outputs], dim=1)[0].float().cpu()
+            for key in beat_window_outputs[0]
+        }
+        beat_probs: dict[str, np.ndarray] = {
+            key: torch.sigmoid(beat_logits[key]).numpy() for key in ("beat", "downbeat")
+        }
+        beat_probs |= {
+            key: torch.softmax(beat_logits[key], dim=-1).numpy()
+            for key in ("bar_beats", "beats_left", "bar_unit")
+            if key in beat_logits
+        }
+        beat_probs |= {key: beat_logits[key].numpy() for key in OFFSETS if key in beat_logits}
+        raw_beats = {"duration": duration_seconds} | beat_model.track_probabilities(beat_probs)
+        beat_grid = sheetsage_beats_to_beat_grid(raw_beats, duration_seconds)
+
+        melody_logits = {
+            key: torch.cat([window_out[key] for window_out in melody_window_outputs], dim=1)[0].float().cpu()
+            for key in melody_window_outputs[0]
+        }
+        melody_probs: dict[str, np.ndarray] = {
+            key: torch.sigmoid(melody_logits[key]).numpy()
+            for key in ("melody", "melody_on", "melody_vocal")
+            if key in melody_logits
+        }
+        melody_probs |= {key: torch.softmax(melody_logits[key], dim=-1).numpy() for key in LINE if key in melody_logits}
+        melody_probs["melody_offset"] = melody_logits["melody_offset"].numpy()
+        melody_prediction, raw_melody = _build_melody_prediction_from_probabilities(
+            melody_model,
+            melody_probs,
+            duration_seconds,
+        )
+        return beat_grid, raw_beats, melody_prediction, raw_melody
+
+    beat_grid: SheetSageBeatGrid | None = None
+    raw_beats: dict[str, Any] | None = None
+    if beat_model is not None:
+        raw_beats = {"duration": duration_seconds} | beat_model.track_probabilities(beat_model.probabilities(wave))
+        beat_grid = sheetsage_beats_to_beat_grid(raw_beats, duration_seconds)
+
+    melody_prediction: SheetSageMelodyPrediction | None = None
+    raw_melody: dict[str, Any] | None = None
+    if melody_model is not None:
+        melody_probs = melody_model.probabilities(wave)
+        melody_prediction, raw_melody = _build_melody_prediction_from_probabilities(
+            melody_model,
+            melody_probs,
+            duration_seconds,
+        )
+    return beat_grid, raw_beats, melody_prediction, raw_melody
 
 
 def predict_sheetsage_beat_grid(
@@ -70,12 +305,7 @@ def predict_sheetsage_beat_grid(
     """
     # エンコーダーは 24 kHz モノラルの float32 波形を受け取る。
     model_rate = int(model.encoder.config.sample_rate)
-    wave = torch.as_tensor(np.asarray(waveform, dtype=np.float32))
-    if int(sample_rate) != model_rate:
-        import torchaudio
-
-        wave = torchaudio.functional.resample(wave, int(sample_rate), model_rate)
-    duration = len(wave) / model_rate
+    wave, duration = _resample_waveform_for_encoder(waveform, sample_rate, model_rate)
     # HeadBeats.track はファイルを読むので、読み込み済みの波形からは
     # probabilities (エンコーダー + bar head) と track_probabilities (HMM) を順に呼ぶ。
     result = {"duration": duration} | model.track_probabilities(model.probabilities(wave))

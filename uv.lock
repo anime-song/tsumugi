@@ -1,5 +1,5 @@
 version = 1
-revision = 3
+revision = 2
 requires-python = ">=3.10, <3.15"
 resolution-markers = [
     "python_full_version >= '3.13' and sys_platform == 'linux'",
@@ -2506,8 +2506,8 @@ wheels = [
 
 [[package]]
 name = "sheetsage2-refined"
-version = "0.2.0"
-source = { git = "https://github.com/anime-song/SheetSage2-Refined#0aa7dff16177ec9d694fce4c998e5fce61accbc2" }
+version = "0.5.2"
+source = { git = "https://github.com/anime-song/SheetSage2-Refined#edb9e7562be134aac92d1eadf5bfe868453d9386" }
 dependencies = [
     { name = "huggingface-hub", extra = ["hf-xet"] },
     { name = "numba" },

@@ -21,6 +21,7 @@ Click either image to open the video on YouTube.
 - **Sustained-note de-fragmentation** — reconnects falsely split sustained notes while preserving true repeated attacks.
 - **Audio-guided beat quantization** — aligns the beat grid to audio onsets and selects the best subdivision per bar with slide and rubato protection.
 - **Closed-loop velocity, CC#7 mix & stereo L/C/R splitting** — iteratively matches per-note dynamics and track loudness (K-weighted), extracts stereo pan (CC#10), and splits double-tracked stereo parts (e.g., L/R rhythm guitars + center solo).
+- **SheetSage2-Refined 0.5.2 beat tracking & vocal melody/harmony fusion** — upgrades to the more stable 0.5.2 beat tracker (`beat-v7u` + refold) and adds no-decoder melody (`melody-m4`) sharing the same encoder pass; non-vocal instrument melodies are filtered out using the separated `vocals` stem audio, and `tsumugi` vocal/harmony notes are re-classified against the gated lead melody anchor to suppress lead↔harmony bleed.
 - **Zero-setup Colab & fast execution** — auto-downloads MIT-licensed `MuseScore_General.sf2`, auto-installs FluidSynth on Colab, adds per-stage toggles with `fast` / `balanced` / `quality` speed presets, and accelerates synthesis/analysis via an in-process `libfluidsynth` pool and GPU signal processing.
 
 <details>
