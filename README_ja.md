@@ -13,6 +13,50 @@
 
 ---
 
+## 最新アップデート（2026-11-23）
+
+🎛️ **Render & Compare 型 MIDI 後処理パイプラインを追加** — 候補 MIDI を FluidSynth で実音レンダリングし、分離ステムおよび原曲ミックスと直接比較して演奏性・ミックス再現度を改善します（`Colab_Inference.ipynb` では全項目デフォルト ON）：
+
+- **GM 128 楽器プログラム選定** — 音色クラスタごとに候補 GM パッチを試聴比較し、元ステムに最も近い音色を選定。
+- **持続音の過分割結合（Defragment）** — 誤って細切れになった持続音を再結合しつつ、本来の連打は保持。
+- **音声参照ビート量子化（Quantize）** — 音声オンセットへビート位相を揃え、スライド・ルバートを保護しながら小節単位で最適量子化を選択（テンポマップも出力）。
+- **閉ループ Velocity・CC#7 ミックス・ステレオ L/C/R 分割** — K-weighted ラウドネスでノート強弱とトラック音量バランスを反復調整し、ステレオパン（CC#10）抽出および左右ダブルトラック＋中央ソロの自動トラック分割に対応。
+- **Colab ゼロ設定＆高速化** — MIT ライセンスの `MuseScore_General.sf2` 自動ダウンロードと Colab での FluidSynth 自動導入、段階別 ON/OFF と速度プリセット（`fast` / `balanced` / `quality`）、常駐 `libfluidsynth` プール＋GPU 信号処理による高速化を実装。
+
+<details>
+<summary><b>更新履歴</b></summary>
+
+| 日付 | 更新内容 |
+| --- | --- |
+| 2026-10-17 | 🥁 `beat_source="sheetsage2"` を SheetSage2-Refined 0.2.0 のビートトラッカーに切り替え。デコーダーを使わずにビート・ダウンビート・小節ごとの拍子を推定します。変拍子の曲でダウンビート F が 0.835→0.883、小節の検出率が 0.661→0.752 に向上し、GPU で 1 曲数秒で動きます。セクションはデコーダーの出力だったため、`Predicted Sections` トラックは出力しなくなりました。 |
+| 2026-10-14 | 🥁 ビート・ダウンビート・拍子の推定に [SheetSage2-Refined](https://github.com/anime-song/SheetSage2-Refined) を追加し、デフォルトに設定（`beat_source="sheetsage2"`。`"tsumugi"` で従来のビートモデル）。ビートの推定精度が向上し、変拍子や拍子の変化にもより対応できるようになりました。曲のセクション（intro、verse、chorus など）も `Predicted Sections` トラックに出力。 |
+| 2026-09-01 | 🥁 Drum model v1.5（`--type drums_v1_5`）を追加し、Colab のドラムステムのデフォルトに設定。実音源評価セットで exact F1 は Drum Kit が 0.6157→0.6890（+7.3ポイント）、All Percussions が 0.1879→0.4044（+21.7ポイント）に向上。 |
+| 2026-08-25 | 🎤 Vocal harmony model v1.5（`--type vocal_harmony_v1_5`）を追加し、Colab の `vocals` ステムのデフォルトに設定。MIR-ST500 のホールドアウト分割で COnP が 0.6052 から 0.6814 に向上。 |
+| 2026-08-20 | ⚡ uv と PyTorch 2.13 へ移行。MPS 推論、AMP、regional compile の制御を追加し、デバイス同期、一時コピー、ステムの重複読み込みを削減。意図的に出力が変わる変更が 2 点あり、CUDA で attention を暗黙に低精度化しないように変更（FP32 がデフォルト）し、V1 のウィンドウバッチでデコード状態をウィンドウ順に伝播するように変更。 |
+| 2026-08-19 | 🎻 Other-instrument model v1.5（`--type other_v1_5`）を追加し、Colab の `other` ステムのデフォルトに設定。実音源評価セットで COnP が 0.7318 から 0.7701 に向上。 |
+| 2026-08-09 | 🎹 Instrument Refinement model を追加。分離ステムオーディオを使って楽器クラスを再割り当てし、曲中で楽器分類が頻繁に切り替わる問題を抑制。RWC-I の overall top-1 は 71.3% から 74.5% に向上する一方、楽器ごとには改善と悪化の両方があるため、[RWC-I ベンチマーク](instrument_agnostic_amt/instrument_refinement/RWC_BENCHMARK.md)を参照。 |
+| 2026-07-30 | パイプラインにビート、コード、キーの推論モデルを追加。デフォルトでは無効。 |
+| 2026-07-24 | 専用のベロシティ予測モデルを追加し、Colab のステムワークフローでデフォルト有効化。 |
+| 2026-07-22 | 🎸 Guitar model v1.5（`--type guitar_v1_5`）を追加し、Colab のギターステムのデフォルトに設定。 |
+| 2026-07-16 | 🐛 ノートタイミングがずれるデータ拡張のバグを修正し、`bass_v2` を再学習。ノート検出を改善し、持続音の過分割を解消（`bass_v2` のみ）。 |
+| 2026-07-15 | 🎸 スラップベースの分類を改善した更新版ベースモデル（`--type bass_v2`）を追加。 |
+| 2026-07-12 | 🎯 ステムごとの楽器クラス選択を追加。確率計算前に不適切な楽器を除外。 |
+| 2026-06-24 | 🥁 実験的なドラム特化モデル（`--type drums`）を追加。 |
+| 2026-06-05 | 🎻 その他の楽器向けモデル（`--type other`）を追加。 |
+| 2026-05-31 | 🎤 Vocal harmony model と `vocal_harmony` クラスを追加。🧩 重複するノート区間のための Pitch Slot を追加。 |
+| 2026-05-20 | 🎸 ギター特化モデル（`--type guitar`）を追加。 |
+| 2026-05-18 | 📦 ピッチシフト／タイムストレッチの前処理スクリプトを追加。 |
+| 2026-05-17 | 🎤 ボーカル特化モデル（`--type vocal`）を追加。 |
+| 2026-05-16 | 🎸 ベース特化モデル（`--type bass`）を追加。 |
+| 2026-05-09 | 🔧 ウィンドウをまたぐノート結合を修正。ビート／コード学習と Colab のステムワークフローを追加。 |
+| 2026-05-06 | 🥁 ドラム検出を改善し、新しいデータ拡張を追加。 |
+| 2026-05-05 | ✨ EMA、楽器損失のマスキング、ディレクトリ一括推論を追加。 |
+| 2026-05-03 | 🚀 初回リリース。 |
+
+</details>
+
+---
+
 ## クイックスタート
 
 最も手軽なのは [`Colab_Inference.ipynb`](Colab_Inference.ipynb) です。曲をアップロードしてセルを実行し、MIDI をダウンロードするだけです。環境構築やチェックポイント探しは必要ありません。
@@ -55,41 +99,10 @@ uv run python -m instrument_agnostic_amt.amt.cli.infer --audio input_song.wav
 ## 特徴
 
 - 🎹 **あらゆる有音程楽器** — ピアノ、ギター、ベース、ボーカル、弦楽器、管楽器などを 1 つのモデルで採譜
-- 🎚️ **ノート単位のベロシティ** — 専用の後処理モデルが分離ステムから強弱を推定
-- 🎯 **ビート、コード、キー** — 任意で使用できる MIDI フレームモデル（デフォルトでは無効）
-- 🧪 **［実験的］楽器分類** — 楽器別 MIDI トラックを出力する 36 クラスのヘッド
-
-<details>
-<summary><b>更新履歴</b></summary>
-
-| 日付 | 更新内容 |
-| --- | --- |
-| 2026-10-17 | 🥁 `beat_source="sheetsage2"` を SheetSage2-Refined 0.2.0 のビートトラッカーに切り替え。デコーダーを使わずにビート・ダウンビート・小節ごとの拍子を推定します。変拍子の曲でダウンビート F が 0.835→0.883、小節の検出率が 0.661→0.752 に向上し、GPU で 1 曲数秒で動きます。セクションはデコーダーの出力だったため、`Predicted Sections` トラックは出力しなくなりました。 |
-| 2026-10-14 | 🥁 ビート・ダウンビート・拍子の推定に [SheetSage2-Refined](https://github.com/anime-song/SheetSage2-Refined) を追加し、デフォルトに設定（`beat_source="sheetsage2"`。`"tsumugi"` で従来のビートモデル）。ビートの推定精度が向上し、変拍子や拍子の変化にもより対応できるようになりました。曲のセクション（intro、verse、chorus など）も `Predicted Sections` トラックに出力。 |
-| 2026-09-01 | 🥁 Drum model v1.5（`--type drums_v1_5`）を追加し、Colab のドラムステムのデフォルトに設定。実音源評価セットで exact F1 は Drum Kit が 0.6157→0.6890（+7.3ポイント）、All Percussions が 0.1879→0.4044（+21.7ポイント）に向上。 |
-| 2026-08-25 | 🎤 Vocal harmony model v1.5（`--type vocal_harmony_v1_5`）を追加し、Colab の `vocals` ステムのデフォルトに設定。MIR-ST500 のホールドアウト分割で COnP が 0.6052 から 0.6814 に向上。 |
-| 2026-08-20 | ⚡ uv と PyTorch 2.13 へ移行。MPS 推論、AMP、regional compile の制御を追加し、デバイス同期、一時コピー、ステムの重複読み込みを削減。意図的に出力が変わる変更が 2 点あり、CUDA で attention を暗黙に低精度化しないように変更（FP32 がデフォルト）し、V1 のウィンドウバッチでデコード状態をウィンドウ順に伝播するように変更。 |
-| 2026-08-19 | 🎻 Other-instrument model v1.5（`--type other_v1_5`）を追加し、Colab の `other` ステムのデフォルトに設定。実音源評価セットで COnP が 0.7318 から 0.7701 に向上。 |
-| 2026-08-09 | 🎹 Instrument Refinement model を追加。分離ステムオーディオを使って楽器クラスを再割り当てし、曲中で楽器分類が頻繁に切り替わる問題を抑制。RWC-I の overall top-1 は 71.3% から 74.5% に向上する一方、楽器ごとには改善と悪化の両方があるため、[RWC-I ベンチマーク](instrument_agnostic_amt/instrument_refinement/RWC_BENCHMARK.md)を参照。 |
-| 2026-07-30 | パイプラインにビート、コード、キーの推論モデルを追加。デフォルトでは無効。 |
-| 2026-07-24 | 専用のベロシティ予測モデルを追加し、Colab のステムワークフローでデフォルト有効化。 |
-| 2026-07-22 | 🎸 Guitar model v1.5（`--type guitar_v1_5`）を追加し、Colab のギターステムのデフォルトに設定。 |
-| 2026-07-16 | 🐛 ノートタイミングがずれるデータ拡張のバグを修正し、`bass_v2` を再学習。ノート検出を改善し、持続音の過分割を解消（`bass_v2` のみ）。 |
-| 2026-07-15 | 🎸 スラップベースの分類を改善した更新版ベースモデル（`--type bass_v2`）を追加。 |
-| 2026-07-12 | 🎯 ステムごとの楽器クラス選択を追加。確率計算前に不適切な楽器を除外。 |
-| 2026-06-24 | 🥁 実験的なドラム特化モデル（`--type drums`）を追加。 |
-| 2026-06-05 | 🎻 その他の楽器向けモデル（`--type other`）を追加。 |
-| 2026-05-31 | 🎤 Vocal harmony model と `vocal_harmony` クラスを追加。🧩 重複するノート区間のための Pitch Slot を追加。 |
-| 2026-05-20 | 🎸 ギター特化モデル（`--type guitar`）を追加。 |
-| 2026-05-18 | 📦 ピッチシフト／タイムストレッチの前処理スクリプトを追加。 |
-| 2026-05-17 | 🎤 ボーカル特化モデル（`--type vocal`）を追加。 |
-| 2026-05-16 | 🎸 ベース特化モデル（`--type bass`）を追加。 |
-| 2026-05-09 | 🔧 ウィンドウをまたぐノート結合を修正。ビート／コード学習と Colab のステムワークフローを追加。 |
-| 2026-05-06 | 🥁 ドラム検出を改善し、新しいデータ拡張を追加。 |
-| 2026-05-05 | ✨ EMA、楽器損失のマスキング、ディレクトリ一括推論を追加。 |
-| 2026-05-03 | 🚀 初回リリース。 |
-
-</details>
+- 🎛️ **Render & Compare 型 MIDI 後処理** — FluidSynth による実音フィードバックで、GM 128 楽器選定・持続音結合・ビート量子化・Velocity / CC#7 / ステレオパンを最適化
+- 🎚️ **ノート単位のベロシティ** — 専用のニューラル予測モデルまたは閉ループ Render & Compare により、分離ステムから強弱とミックスバランスを再現
+- 🎯 **ビート、コード、キー** — SheetSage2-Refined / 内蔵モデルによるビート・拍子・コード・キー推定
+- 🧪 **［実験的］楽器分類** — 36 クラスのヘッドと Render & Compare による GM 128 楽器トラック割り当て
 
 ---
 
@@ -169,9 +182,11 @@ python -m instrument_agnostic_amt.amt.cli.infer --audio input_song.wav --compile
 
 ### ステム分離ワークフロー
 
-[`Colab_Inference.ipynb`](Colab_Inference.ipynb) には、曲をステムに分離・採譜し、各ノートの楽器を再分類し、ベロシティを予測するワークフローがあります。
+[`Colab_Inference.ipynb`](Colab_Inference.ipynb) には、曲をステムに分離・採譜し、Render & Compare 型の音声参照 MIDI 後処理（GM 128 楽器選定・持続音結合・ビート量子化・閉ループ Velocity / CC#7 / ステレオパン最適化）までを一貫実行するワークフローがあります。
 
 ミックス全体を 1 回で処理するより遅いものの、通常は高い精度が得られます。各ステムの音響が単純になり、楽器の重なりが減るためです。差が特に大きいのは、密度の高いミックス、バンド録音、持続和音にメロディを重ねたアレンジです。
+
+Render & Compare の各段階は個別に ON/OFF でき、`render_compare_speed`（`"fast"` / `"balanced"` / `"quality"`）で速度と精度のバランスを調整できます。Colab では FluidSynth が自動導入され（ローカル環境では Ubuntu/Debian: `apt-get install -y fluidsynth`、macOS: `brew install fluid-synth`、Windows: 公式バイナリ）、`soundfont_path` / `TSUMUGI_SOUNDFONT_PATH` 未指定時は MIT ライセンスの `MuseScore_General.sf2` が自動ダウンロードされます。
 
 `predict_beat_chord=True` のとき、`beat_source` でビート・拍子の推定元を選べます。`"sheetsage2"`（既定）は元音源から [SheetSage2-Refined](https://github.com/anime-song/SheetSage2-Refined) のビートトラッカー（デコーダーなし）で推定します。`"tsumugi"` は内蔵のビートモデルを使います。コードとキーは常に tsumugi の推定です。`uv sync --locked --extra stem --extra sheetsage` でインストールしてください。SheetSage2-Refined の重み（2.7 GB）は CC BY-NC 4.0（非商用のみ）です。
 
@@ -384,8 +399,10 @@ instrument_agnostic_amt/
 ├── amt/                        # AMT 本体のモデル・推論・データ・CLI
 ├── taxonomy/                   # 楽器クラスと GM の対応
 ├── beat_chord/                 # 公開 beat/chord モデルと推論
-├── instrument_refinement/      # 公開 refinement モデルと推論
-├── velocity/                   # 公開 velocity モデルと推論
+├── instrument_refinement/      # 楽器再判定と Render & Compare GM 選定
+├── quantization/               # Render & Compare 持続音結合・ビート量子化
+├── velocity/                   # ベロシティ予測・Render & Compare 音量最適化・ステレオパン/LCR
+├── soundfont.py                # SoundFont 自動ダウンロードと常駐 libfluidsynth プール
 └── cli/                        # 複数モデルを束ねるステム推論
 
 recipes/

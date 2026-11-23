@@ -13,6 +13,50 @@ Click either image to open the video on YouTube.
 
 ---
 
+## Latest update (2026-11-23)
+
+🎛️ **Render & Compare MIDI post-processing pipeline** — renders candidate MIDI with FluidSynth and compares it directly against the separated stems and original mix to improve playability and mix realism (all enabled by default in `Colab_Inference.ipynb`):
+
+- **GM 128 instrument selection** — auditions candidate GM patches per timbre cluster and selects the closest match to the original stem.
+- **Sustained-note de-fragmentation** — reconnects falsely split sustained notes while preserving true repeated attacks.
+- **Audio-guided beat quantization** — aligns the beat grid to audio onsets and selects the best subdivision per bar with slide and rubato protection.
+- **Closed-loop velocity, CC#7 mix & stereo L/C/R splitting** — iteratively matches per-note dynamics and track loudness (K-weighted), extracts stereo pan (CC#10), and splits double-tracked stereo parts (e.g., L/R rhythm guitars + center solo).
+- **Zero-setup Colab & fast execution** — auto-downloads MIT-licensed `MuseScore_General.sf2`, auto-installs FluidSynth on Colab, adds per-stage toggles with `fast` / `balanced` / `quality` speed presets, and accelerates synthesis/analysis via an in-process `libfluidsynth` pool and GPU signal processing.
+
+<details>
+<summary><b>Changelog</b></summary>
+
+| Date | Update |
+| --- | --- |
+| 2026-10-17 | 🥁 Switched `beat_source="sheetsage2"` to the SheetSage2-Refined 0.2.0 beat tracker, which tracks beats, downbeats, and each bar's time signature without the decoder. On odd-meter songs, downbeat F improves from 0.835 to 0.883 and bars found from 0.661 to 0.752, and it runs in a few seconds per song on a GPU. The `Predicted Sections` track is no longer written, since sections came from the decoder. |
+| 2026-10-14 | 🥁 Added [SheetSage2-Refined](https://github.com/anime-song/SheetSage2-Refined) as the default source for beats, downbeats, and time signatures (`beat_source="sheetsage2"`; `"tsumugi"` keeps the built-in beat model). Beat tracking is more accurate and handles odd meters and meter changes better. Song sections (intro, verse, chorus, ...) are written to a `Predicted Sections` track. |
+| 2026-09-01 | 🥁 Added Drum model v1.5 (`--type drums_v1_5`) and made it the Colab default for drum stems. On the real-audio evaluation set (50 ms tolerance, audio-aligned, canonical drum pitches: 40→38 and 57→49), exact F1 improved from 0.6157 to 0.6890 for Drum Kit (+7.3 points) and from 0.1879 to 0.4044 for All Percussions (+21.7 points). |
+| 2026-08-25 | 🎤 Added Vocal Harmony model v1.5 (`--type vocal_harmony_v1_5`) and made it the Colab default for `vocals` stems. COnP improved from 0.6052 to 0.6814 on the held-out MIR-ST500 split. |
+| 2026-08-20 | ⚡ Migrated to uv and PyTorch 2.13. Added MPS inference and AMP/regional compile controls; reduced device synchronization, temporary copies, and repeated stem loading. Two changes intentionally affect output: CUDA attention no longer downcasts implicitly (FP32 is now the default), and V1 window batching propagates decode state in window order. |
+| 2026-08-19 | 🎻 Added Other-Instrument model v1.5 (`--type other_v1_5`) and made it the Colab default for `other` stems. COnP improved from 0.7318 to 0.7701 on an in-house real-recording set. |
+| 2026-08-09 | 🎹 Added the Instrument Refinement model. It reassigns instrument classes from separated stems to reduce label flicker within a piece. Overall top-1 accuracy on RWC-I improved from 71.3% to 74.5%, although results vary by instrument; see the [RWC-I benchmark](instrument_agnostic_amt/instrument_refinement/RWC_BENCHMARK.md). |
+| 2026-07-30 | Added beat, chord, and key inference models to the pipeline. Disabled by default. |
+| 2026-07-24 | Added a dedicated velocity model and enabled it by default in the Colab stem workflow. |
+| 2026-07-22 | 🎸 Added Guitar model v1.5 (`--type guitar_v1_5`) and made it the Colab default for guitar stems. |
+| 2026-07-16 | 🐛 Fixed a data-augmentation bug that misaligned note timing, then retrained `bass_v2`. Note detection improved and sustained-note over-segmentation was fixed for `bass_v2`. |
+| 2026-07-15 | 🎸 Added the updated bass model (`--type bass_v2`) with improved slap-bass classification. |
+| 2026-07-12 | 🎯 Added per-stem instrument class selection, excluding implausible instruments before probability calculation. |
+| 2026-06-24 | 🥁 Added the experimental drum-focused model (`--type drums`). |
+| 2026-06-05 | 🎻 Added the other-instrument model (`--type other`). |
+| 2026-05-31 | 🎤 Added the Vocal Harmony model and `vocal_harmony` class. 🧩 Added Pitch Slots for overlapping note intervals. |
+| 2026-05-20 | 🎸 Added the guitar-focused model (`--type guitar`). |
+| 2026-05-18 | 📦 Added pitch-shift and time-stretch preprocessing scripts. |
+| 2026-05-17 | 🎤 Added the vocal-focused model (`--type vocal`). |
+| 2026-05-16 | 🎸 Added the bass-focused model (`--type bass`). |
+| 2026-05-09 | 🔧 Fixed cross-window note stitching. Added beat/chord training and the Colab stem workflow. |
+| 2026-05-06 | 🥁 Improved drum detection and added new augmentations. |
+| 2026-05-05 | ✨ Added EMA, instrument loss masking, and batch directory inference. |
+| 2026-05-03 | 🚀 Initial release. |
+
+</details>
+
+---
+
 ## Quick start
 
 The easiest way to get started is [`Colab_Inference.ipynb`](Colab_Inference.ipynb): upload a song, run the cells, and download the MIDI. No local setup or checkpoint search required.
@@ -55,41 +99,10 @@ tsumugi works best on clean, sustained material where each stem is monophonic. A
 ## Features
 
 - 🎹 **Any pitched instrument** — transcribe piano, guitar, bass, vocals, strings, winds, and more with one model
-- 🎚️ **Per-note velocity** — a dedicated post-processing model estimates dynamics from separated stems
-- 🎯 **Beat, chord, and key** — optional MIDI-frame models, disabled by default
-- 🧪 **[Experimental] Instrument classification** — a 36-class head for per-instrument MIDI tracks
-
-<details>
-<summary><b>Changelog</b></summary>
-
-| Date | Update |
-| --- | --- |
-| 2026-10-17 | 🥁 Switched `beat_source="sheetsage2"` to the SheetSage2-Refined 0.2.0 beat tracker, which tracks beats, downbeats, and each bar's time signature without the decoder. On odd-meter songs, downbeat F improves from 0.835 to 0.883 and bars found from 0.661 to 0.752, and it runs in a few seconds per song on a GPU. The `Predicted Sections` track is no longer written, since sections came from the decoder. |
-| 2026-10-14 | 🥁 Added [SheetSage2-Refined](https://github.com/anime-song/SheetSage2-Refined) as the default source for beats, downbeats, and time signatures (`beat_source="sheetsage2"`; `"tsumugi"` keeps the built-in beat model). Beat tracking is more accurate and handles odd meters and meter changes better. Song sections (intro, verse, chorus, ...) are written to a `Predicted Sections` track. |
-| 2026-09-01 | 🥁 Added Drum model v1.5 (`--type drums_v1_5`) and made it the Colab default for drum stems. On the real-audio evaluation set (50 ms tolerance, audio-aligned, canonical drum pitches: 40→38 and 57→49), exact F1 improved from 0.6157 to 0.6890 for Drum Kit (+7.3 points) and from 0.1879 to 0.4044 for All Percussions (+21.7 points). |
-| 2026-08-25 | 🎤 Added Vocal Harmony model v1.5 (`--type vocal_harmony_v1_5`) and made it the Colab default for `vocals` stems. COnP improved from 0.6052 to 0.6814 on the held-out MIR-ST500 split. |
-| 2026-08-20 | ⚡ Migrated to uv and PyTorch 2.13. Added MPS inference and AMP/regional compile controls; reduced device synchronization, temporary copies, and repeated stem loading. Two changes intentionally affect output: CUDA attention no longer downcasts implicitly (FP32 is now the default), and V1 window batching propagates decode state in window order. |
-| 2026-08-19 | 🎻 Added Other-Instrument model v1.5 (`--type other_v1_5`) and made it the Colab default for `other` stems. COnP improved from 0.7318 to 0.7701 on an in-house real-recording set. |
-| 2026-08-09 | 🎹 Added the Instrument Refinement model. It reassigns instrument classes from separated stems to reduce label flicker within a piece. Overall top-1 accuracy on RWC-I improved from 71.3% to 74.5%, although results vary by instrument; see the [RWC-I benchmark](instrument_agnostic_amt/instrument_refinement/RWC_BENCHMARK.md). |
-| 2026-07-30 | Added beat, chord, and key inference models to the pipeline. Disabled by default. |
-| 2026-07-24 | Added a dedicated velocity model and enabled it by default in the Colab stem workflow. |
-| 2026-07-22 | 🎸 Added Guitar model v1.5 (`--type guitar_v1_5`) and made it the Colab default for guitar stems. |
-| 2026-07-16 | 🐛 Fixed a data-augmentation bug that misaligned note timing, then retrained `bass_v2`. Note detection improved and sustained-note over-segmentation was fixed for `bass_v2`. |
-| 2026-07-15 | 🎸 Added the updated bass model (`--type bass_v2`) with improved slap-bass classification. |
-| 2026-07-12 | 🎯 Added per-stem instrument class selection, excluding implausible instruments before probability calculation. |
-| 2026-06-24 | 🥁 Added the experimental drum-focused model (`--type drums`). |
-| 2026-06-05 | 🎻 Added the other-instrument model (`--type other`). |
-| 2026-05-31 | 🎤 Added the Vocal Harmony model and `vocal_harmony` class. 🧩 Added Pitch Slots for overlapping note intervals. |
-| 2026-05-20 | 🎸 Added the guitar-focused model (`--type guitar`). |
-| 2026-05-18 | 📦 Added pitch-shift and time-stretch preprocessing scripts. |
-| 2026-05-17 | 🎤 Added the vocal-focused model (`--type vocal`). |
-| 2026-05-16 | 🎸 Added the bass-focused model (`--type bass`). |
-| 2026-05-09 | 🔧 Fixed cross-window note stitching. Added beat/chord training and the Colab stem workflow. |
-| 2026-05-06 | 🥁 Improved drum detection and added new augmentations. |
-| 2026-05-05 | ✨ Added EMA, instrument loss masking, and batch directory inference. |
-| 2026-05-03 | 🚀 Initial release. |
-
-</details>
+- 🎛️ **Render & Compare MIDI post-processing** — audio-guided GM 128 patch selection, sustained-note de-fragmentation, beat quantization, and closed-loop velocity / CC#7 / stereo pan optimization via FluidSynth
+- 🎚️ **Per-note velocity** — neural velocity model or closed-loop Render & Compare loudness/dynamics matching from separated stems
+- 🎯 **Beat, chord, and key** — SheetSage2-Refined / built-in beat tracking, chord, and key estimation
+- 🧪 **[Experimental] Instrument classification** — a 36-class head plus Render & Compare GM 128 refinement for per-instrument MIDI tracks
 
 ---
 
@@ -167,9 +180,11 @@ The first window pays the compilation cost, so a short one-off transcription may
 
 ### Stem-separated workflow
 
-[`Colab_Inference.ipynb`](Colab_Inference.ipynb) includes a workflow that separates a song into stems, transcribes them, reclassifies each note's instrument, and predicts velocity.
+[`Colab_Inference.ipynb`](Colab_Inference.ipynb) includes a workflow that separates a song into stems, transcribes them, and runs audio-guided Render & Compare MIDI post-processing (GM 128 instrument refinement, sustained-note de-fragmentation, beat quantization, and closed-loop velocity / CC#7 / stereo pan optimization).
 
 It is slower than a single pass over the mix, but usually more accurate because each stem is acoustically simpler and contains fewer overlapping instruments. The benefit is greatest for dense mixes, band recordings, and arrangements with sustained chords under a melody.
+
+For Render & Compare stages, each step can be toggled individually and tuned with `render_compare_speed` (`"fast"`, `"balanced"`, `"quality"`). FluidSynth is installed automatically on Colab (locally: `apt-get install -y fluidsynth` on Ubuntu/Debian, `brew install fluid-synth` on macOS, or the official Windows binary), and `MuseScore_General.sf2` (MIT license) is downloaded automatically unless `soundfont_path` / `TSUMUGI_SOUNDFONT_PATH` is specified.
 
 With `predict_beat_chord=True`, `beat_source` chooses where beats and time signatures come from. `"sheetsage2"` (default) runs the [SheetSage2-Refined](https://github.com/anime-song/SheetSage2-Refined) beat tracker (no decoder) on the original mix; `"tsumugi"` uses the built-in beat model. Chords and keys always come from tsumugi. Install with `uv sync --locked --extra stem --extra sheetsage`. The SheetSage2-Refined weights (2.7 GB) are CC BY-NC 4.0 (non-commercial use only).
 
@@ -382,8 +397,10 @@ instrument_agnostic_amt/
 ├── amt/                        # Core AMT model, inference, data, and CLI
 ├── taxonomy/                   # Instrument classes and GM mappings
 ├── beat_chord/                 # Public beat/chord models and inference
-├── instrument_refinement/      # Public refinement model and inference
-├── velocity/                   # Public velocity model and inference
+├── instrument_refinement/      # Instrument refinement and Render & Compare GM selection
+├── quantization/               # Render & Compare de-fragmentation and beat quantization
+├── velocity/                   # Velocity model, Render & Compare mix/dynamics, stereo pan/LCR
+├── soundfont.py                # SoundFont auto-download and resident libfluidsynth pool
 └── cli/                        # Composed stem inference pipeline
 
 recipes/
