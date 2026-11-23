@@ -15,14 +15,14 @@
 
 ## 最新アップデート（2026-11-23）
 
-🎛️ **Render & Compare 型 MIDI 後処理パイプラインを追加** — 候補 MIDI を FluidSynth で実音レンダリングし、分離ステムおよび原曲ミックスと直接比較して演奏性・ミックス再現度を改善します（`Colab_Inference.ipynb` では全項目デフォルト ON）：
+採譜した MIDI を一度 FluidSynth で鳴らして元の音源と聴き比べながら仕上げる後処理を追加し、[SheetSage2-Refined](https://github.com/anime-song/SheetSage2-Refined) も 0.5.2 に更新しました（`Colab_Inference.ipynb` ではすべてデフォルト ON です）。
 
-- **GM 128 楽器プログラム選定** — 音色クラスタごとに候補 GM パッチを試聴比較し、元ステムに最も近い音色を選定。
-- **持続音の過分割結合（Defragment）** — 誤って細切れになった持続音を再結合しつつ、本来の連打は保持。
-- **音声参照ビート量子化（Quantize）** — 音声オンセットへビート位相を揃え、スライド・ルバートを保護しながら小節単位で最適量子化を選択（テンポマップも出力）。
-- **閉ループ Velocity・CC#7 ミックス・ステレオ L/C/R 分割** — K-weighted ラウドネスでノート強弱とトラック音量バランスを反復調整し、ステレオパン（CC#10）抽出および左右ダブルトラック＋中央ソロの自動トラック分割に対応。
-- **SheetSage2-Refined 0.5.2 ビート＆ボーカル主旋律／ハモリ融合** — より安定した 0.5.2 のビートトラッカーへ更新し、同一エンコーダの 1 パスでデコーダーなしメロディ（`melody-m4`）も同時推定。分離 `vocals` ステム音声で歌声以外の楽器メロディを除去したうえで、確定主旋律アンカーと `tsumugi` ボーカル／ハモリを融合して主旋律↔ハモリ誤混入を抑制。
-- **Colab ゼロ設定＆高速化** — MIT ライセンスの `MuseScore_General.sf2` 自動ダウンロードと Colab での FluidSynth 自動導入、段階別 ON/OFF と速度プリセット（`fast` / `balanced` / `quality`）、常駐 `libfluidsynth` プール＋GPU 信号処理による高速化を実装。
+- **楽器の選び直し** — 候補の GM 音色を実際に鳴らして元のステムと比べ、いちばん近い音色を選びます。
+- **途切れた持続音の修正** — ストリングスや管楽器などで 1 つの音が細切れになってしまう箇所をつなぎ直します（本来の連打はそのまま残します）。
+- **リズムの補正** — 検出したビートに合わせてタイミングを整えます。3 連符やスライドなど、揃えると不自然になる箇所は元のタイミングを保ちます。
+- **音量バランスと左右の定位** — 元の音源に近づくようノートごとの強弱・トラック音量（CC#7）・パン（CC#10）を調整します。左右に振られたバッキングと中央のソロが混ざるギターなどは別トラックに分けます。
+- **SheetSage2-Refined 0.5.2 対応とボーカル改善** — ビート推定を 0.5.2 に更新し、ボーカルの主旋律にも SheetSage2-Refined を使うようにしました。分離したボーカル音声を使って楽器メロディの混入を防ぎ、tsumugi で採譜したハモリと組み合わせて、主旋律とハモリの取り違えやタイミングのズレを抑えています（スウィングにも対応）。
+- **Colab での使いやすさ改善** — FluidSynth と SoundFont（`MuseScore_General.sf2` / MIT ライセンス）を自動で用意します。各処理の ON/OFF や速度設定（`fast` / `balanced` / `quality`）もフォームから選べます。
 
 <details>
 <summary><b>更新履歴</b></summary>
@@ -100,10 +100,10 @@ uv run python -m instrument_agnostic_amt.amt.cli.infer --audio input_song.wav
 ## 特徴
 
 - 🎹 **あらゆる有音程楽器** — ピアノ、ギター、ベース、ボーカル、弦楽器、管楽器などを 1 つのモデルで採譜
-- 🎛️ **Render & Compare 型 MIDI 後処理** — FluidSynth による実音フィードバックで、GM 128 楽器選定・持続音結合・ビート量子化・Velocity / CC#7 / ステレオパンを最適化
-- 🎚️ **ノート単位のベロシティ** — 専用のニューラル予測モデルまたは閉ループ Render & Compare により、分離ステムから強弱とミックスバランスを再現
-- 🎯 **ビート、コード、キー** — SheetSage2-Refined / 内蔵モデルによるビート・拍子・コード・キー推定
-- 🧪 **［実験的］楽器分類** — 36 クラスのヘッドと Render & Compare による GM 128 楽器トラック割り当て
+- 🎛️ **実音比較による MIDI 仕上げ** — FluidSynth で鳴らした音を元音源と比べ、楽器選定・途切れた持続音の修正・リズム補正・音量やパンの調整を自動で実行
+- 🎚️ **ノート単位のベロシティ** — 専用の予測モデル、または実音比較による音量調整で強弱を再現
+- 🎯 **ビート、コード、キー** — SheetSage2-Refined や内蔵モデルでビート・拍子・コード・キーを推定
+- 🧪 **［実験的］楽器分類** — 36 クラスの分類と実音比較による GM 音色選定で楽器別トラックを出力
 
 ---
 
@@ -183,13 +183,13 @@ python -m instrument_agnostic_amt.amt.cli.infer --audio input_song.wav --compile
 
 ### ステム分離ワークフロー
 
-[`Colab_Inference.ipynb`](Colab_Inference.ipynb) には、曲をステムに分離・採譜し、Render & Compare 型の音声参照 MIDI 後処理（GM 128 楽器選定・持続音結合・ビート量子化・閉ループ Velocity / CC#7 / ステレオパン最適化）までを一貫実行するワークフローがあります。
+[`Colab_Inference.ipynb`](Colab_Inference.ipynb) では、曲をステムに分離してそれぞれ採譜したあと、楽器選定・持続音の修正・リズム補正・音量やパンの調整をまとめて行って 1 本の MIDI に仕上げます。
 
 ミックス全体を 1 回で処理するより遅いものの、通常は高い精度が得られます。各ステムの音響が単純になり、楽器の重なりが減るためです。差が特に大きいのは、密度の高いミックス、バンド録音、持続和音にメロディを重ねたアレンジです。
 
-Render & Compare の各段階は個別に ON/OFF でき、`render_compare_speed`（`"fast"` / `"balanced"` / `"quality"`）で速度と精度のバランスを調整できます。Colab では FluidSynth が自動導入され（ローカル環境では Ubuntu/Debian: `apt-get install -y fluidsynth`、macOS: `brew install fluid-synth`、Windows: 公式バイナリ）、`soundfont_path` / `TSUMUGI_SOUNDFONT_PATH` 未指定時は MIT ライセンスの `MuseScore_General.sf2` が自動ダウンロードされます。
+各後処理は個別に ON/OFF でき、`render_compare_speed`（`"fast"` / `"balanced"` / `"quality"`）で速度と精度のバランスを選べます。Colab では FluidSynth が自動で入り（ローカル環境では Ubuntu/Debian: `apt-get install -y fluidsynth`、macOS: `brew install fluid-synth`、Windows: 公式バイナリ）、`soundfont_path` や `TSUMUGI_SOUNDFONT_PATH` を指定しない場合は `MuseScore_General.sf2`（MIT ライセンス）が自動でダウンロードされます。
 
-`predict_beat_chord=True` のとき、`beat_source` でビート・拍子の推定元を選べます。`"sheetsage2"`（既定）は元音源から [SheetSage2-Refined](https://github.com/anime-song/SheetSage2-Refined) のビートトラッカー（デコーダーなし）で推定します。`"tsumugi"` は内蔵のビートモデルを使います。コードとキーは常に tsumugi の推定です。`uv sync --locked --extra stem --extra sheetsage` でインストールしてください。SheetSage2-Refined の重み（2.7 GB）は CC BY-NC 4.0（非商用のみ）です。
+`beat_source` と `vocal_melody_source` の既定値は `"sheetsage2"` です。[SheetSage2-Refined](https://github.com/anime-song/SheetSage2-Refined) 0.5.2（デコーダーなし）でビート・拍子とボーカル主旋律を推定し、ボーカルは分離ステム音声で楽器メロディを除いたうえで tsumugi のハモリと統合します。内蔵モデルだけを使いたい場合は `"tsumugi"` を指定してください（コードとキーは常に tsumugi の推定です）。`uv sync --locked --extra stem --extra sheetsage` でインストールできます。SheetSage2-Refined の重み（2.7 GB）は CC BY-NC 4.0（非商用のみ）です。
 
 ### 楽器再判定の単体実行
 
@@ -399,11 +399,11 @@ python -m instrument_agnostic_amt.beat_chord.cli.infer --checkpoint path/to/chec
 instrument_agnostic_amt/
 ├── amt/                        # AMT 本体のモデル・推論・データ・CLI
 ├── taxonomy/                   # 楽器クラスと GM の対応
-├── beat_chord/                 # 公開 beat/chord モデルと推論
-├── instrument_refinement/      # 楽器再判定と Render & Compare GM 選定
-├── quantization/               # Render & Compare 持続音結合・ビート量子化
-├── velocity/                   # ベロシティ予測・Render & Compare 音量最適化・ステレオパン/LCR
-├── soundfont.py                # SoundFont 自動ダウンロードと常駐 libfluidsynth プール
+├── beat_chord/                 # ビート／コード推定、SheetSage2 連携、ボーカル統合
+├── instrument_refinement/      # 楽器再判定と GM 音色選定
+├── quantization/               # 持続音の結合とビート量子化
+├── velocity/                   # ベロシティ予測・音量バランス調整・ステレオパン
+├── soundfont.py                # SoundFont の自動ダウンロードと FluidSynth レンダリング
 └── cli/                        # 複数モデルを束ねるステム推論
 
 recipes/

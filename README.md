@@ -15,14 +15,14 @@ Click either image to open the video on YouTube.
 
 ## Latest update (2026-11-23)
 
-🎛️ **Render & Compare MIDI post-processing pipeline** — renders candidate MIDI with FluidSynth and compares it directly against the separated stems and original mix to improve playability and mix realism (all enabled by default in `Colab_Inference.ipynb`):
+Added audio-feedback MIDI post-processing and upgraded [SheetSage2-Refined](https://github.com/anime-song/SheetSage2-Refined) to 0.5.2 (all enabled by default in `Colab_Inference.ipynb`). The pipeline renders candidate MIDI with FluidSynth and compares it against the separated stems and original mix to clean up instruments, timing, and mix balance:
 
-- **GM 128 instrument selection** — auditions candidate GM patches per timbre cluster and selects the closest match to the original stem.
-- **Sustained-note de-fragmentation** — reconnects falsely split sustained notes while preserving true repeated attacks.
-- **Audio-guided beat quantization** — aligns the beat grid to audio onsets and selects the best subdivision per bar with slide and rubato protection.
-- **Closed-loop velocity, CC#7 mix & stereo L/C/R splitting** — iteratively matches per-note dynamics and track loudness (K-weighted), extracts stereo pan (CC#10), and splits double-tracked stereo parts (e.g., L/R rhythm guitars + center solo).
-- **SheetSage2-Refined 0.5.2 beat tracking & vocal melody/harmony fusion** — upgrades to the more stable 0.5.2 beat tracker (`beat-v7u` + refold) and adds no-decoder melody (`melody-m4`) sharing the same encoder pass; non-vocal instrument melodies are filtered out using the separated `vocals` stem audio, and `tsumugi` vocal/harmony notes are re-classified against the gated lead melody anchor to suppress lead↔harmony bleed.
-- **Zero-setup Colab & fast execution** — auto-downloads MIT-licensed `MuseScore_General.sf2`, auto-installs FluidSynth on Colab, adds per-stage toggles with `fast` / `balanced` / `quality` speed presets, and accelerates synthesis/analysis via an in-process `libfluidsynth` pool and GPU signal processing.
+- **Better instrument choices** — renders candidate GM patches and picks the closest match to each stem.
+- **Fewer split sustained notes** — reconnects broken sustained notes (such as strings or winds) while keeping genuine repeated notes intact.
+- **Cleaner timing** — aligns notes to the detected beat grid only where it brings the rendered audio closer to the original, leaving triplets, slides, and rubato alone.
+- **Mix balance and stereo pan** — iteratively adjusts per-note velocity, track volume (CC#7), and pan (CC#10) to match the original audio, and splits hard-panned double-tracked parts (such as L/R rhythm guitars with a center solo) into separate tracks.
+- **SheetSage2-Refined 0.5.2 beats and vocals** — updates beat tracking to 0.5.2 and uses its melody head for lead vocals. The separated vocal stem filters out instrumental melodies, and harmonies transcribed by tsumugi are merged and rhythm-aligned with the lead (preserving swing where the audio supports it).
+- **Ready to run in Colab** — automatically installs FluidSynth and downloads `MuseScore_General.sf2` (MIT license), with individual on/off switches and `fast` / `balanced` / `quality` speed presets.
 
 <details>
 <summary><b>Changelog</b></summary>
@@ -100,10 +100,10 @@ tsumugi works best on clean, sustained material where each stem is monophonic. A
 ## Features
 
 - 🎹 **Any pitched instrument** — transcribe piano, guitar, bass, vocals, strings, winds, and more with one model
-- 🎛️ **Render & Compare MIDI post-processing** — audio-guided GM 128 patch selection, sustained-note de-fragmentation, beat quantization, and closed-loop velocity / CC#7 / stereo pan optimization via FluidSynth
-- 🎚️ **Per-note velocity** — neural velocity model or closed-loop Render & Compare loudness/dynamics matching from separated stems
-- 🎯 **Beat, chord, and key** — SheetSage2-Refined / built-in beat tracking, chord, and key estimation
-- 🧪 **[Experimental] Instrument classification** — a 36-class head plus Render & Compare GM 128 refinement for per-instrument MIDI tracks
+- 🎛️ **Audio-feedback MIDI cleanup** — compares FluidSynth renders against the original audio to refine GM instruments, fix split sustained notes, quantize timing, and balance track volume and stereo pan
+- 🎚️ **Per-note velocity** — estimates dynamics from separated stems via a neural velocity model or FluidSynth audio comparison
+- 🎯 **Beat, chord, and key** — estimates beats, time signatures, chords, and keys (SheetSage2-Refined or built-in models)
+- 🧪 **[Experimental] Instrument classification** — a 36-class head plus GM refinement for per-instrument MIDI tracks
 
 ---
 
@@ -181,13 +181,13 @@ The first window pays the compilation cost, so a short one-off transcription may
 
 ### Stem-separated workflow
 
-[`Colab_Inference.ipynb`](Colab_Inference.ipynb) includes a workflow that separates a song into stems, transcribes them, and runs audio-guided Render & Compare MIDI post-processing (GM 128 instrument refinement, sustained-note de-fragmentation, beat quantization, and closed-loop velocity / CC#7 / stereo pan optimization).
+[`Colab_Inference.ipynb`](Colab_Inference.ipynb) separates a song into stems, transcribes each stem, and runs optional audio-feedback post-processing (instrument selection, sustained-note cleanup, beat quantization, velocity, track volume, and stereo pan) before merging everything into one MIDI file.
 
 It is slower than a single pass over the mix, but usually more accurate because each stem is acoustically simpler and contains fewer overlapping instruments. The benefit is greatest for dense mixes, band recordings, and arrangements with sustained chords under a melody.
 
-For Render & Compare stages, each step can be toggled individually and tuned with `render_compare_speed` (`"fast"`, `"balanced"`, `"quality"`). FluidSynth is installed automatically on Colab (locally: `apt-get install -y fluidsynth` on Ubuntu/Debian, `brew install fluid-synth` on macOS, or the official Windows binary), and `MuseScore_General.sf2` (MIT license) is downloaded automatically unless `soundfont_path` / `TSUMUGI_SOUNDFONT_PATH` is specified.
+Each post-processing step can be turned on or off individually, and `render_compare_speed` (`"fast"`, `"balanced"`, `"quality"`) controls the speed/quality trade-off. FluidSynth is installed automatically on Colab (locally: `apt-get install -y fluidsynth` on Ubuntu/Debian, `brew install fluid-synth` on macOS, or the official Windows binary), and `MuseScore_General.sf2` (MIT license) is downloaded automatically unless `soundfont_path` or `TSUMUGI_SOUNDFONT_PATH` is set.
 
-With `predict_beat_chord=True`, `beat_source` chooses where beats and time signatures come from. `"sheetsage2"` (default) runs the [SheetSage2-Refined](https://github.com/anime-song/SheetSage2-Refined) beat tracker (no decoder) on the original mix; `"tsumugi"` uses the built-in beat model. Chords and keys always come from tsumugi. Install with `uv sync --locked --extra stem --extra sheetsage`. The SheetSage2-Refined weights (2.7 GB) are CC BY-NC 4.0 (non-commercial use only).
+`beat_source` and `vocal_melody_source` default to `"sheetsage2"`, which uses [SheetSage2-Refined](https://github.com/anime-song/SheetSage2-Refined) 0.5.2 (no decoder) for beats, time signatures, and lead vocals (gated by the separated vocal stem and combined with tsumugi's vocal harmonies). Set either to `"tsumugi"` to use only the built-in models; chords and keys always come from tsumugi. Install with `uv sync --locked --extra stem --extra sheetsage`. The SheetSage2-Refined weights (2.7 GB) are CC BY-NC 4.0 (non-commercial use only).
 
 ### Standalone instrument refinement
 
@@ -397,11 +397,11 @@ python -m instrument_agnostic_amt.beat_chord.cli.infer --checkpoint path/to/chec
 instrument_agnostic_amt/
 ├── amt/                        # Core AMT model, inference, data, and CLI
 ├── taxonomy/                   # Instrument classes and GM mappings
-├── beat_chord/                 # Public beat/chord models and inference
-├── instrument_refinement/      # Instrument refinement and Render & Compare GM selection
-├── quantization/               # Render & Compare de-fragmentation and beat quantization
-├── velocity/                   # Velocity model, Render & Compare mix/dynamics, stereo pan/LCR
-├── soundfont.py                # SoundFont auto-download and resident libfluidsynth pool
+├── beat_chord/                 # Beat/chord models, SheetSage2 integration, and vocal fusion
+├── instrument_refinement/      # Instrument refinement and GM selection
+├── quantization/               # Sustained-note merging and beat quantization
+├── velocity/                   # Velocity prediction, mix balance, and stereo pan
+├── soundfont.py                # SoundFont download and FluidSynth rendering
 └── cli/                        # Composed stem inference pipeline
 
 recipes/
