@@ -291,6 +291,7 @@ def test_colab_notebook_json_syntax_and_release_options() -> None:
         "RENDER_COMPARE_SPEED = \"balanced\"",
         "SOUNDFONT_PATH = \"\"",
         "fluidsynth",
+        "importlib.util.find_spec(\"sheetsage2_refined\") is None",
         "sheetsage2_refined.melody",
         "edb9e7562be134aac92d1eadf5bfe868453d9386",
     ):
