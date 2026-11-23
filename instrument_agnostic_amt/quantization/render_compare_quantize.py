@@ -27,14 +27,12 @@ from __future__ import annotations
 import copy
 import json
 import math
-import subprocess
 import tempfile
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-import mido
 import numpy as np
 import pretty_midi
 import soundfile as sf
@@ -43,7 +41,17 @@ import torchaudio.functional as audio_functional
 
 from ..beat_chord.sheetsage import sheetsage_beats_to_beat_grid
 from ..beat_chord.tempo_map_export import MeterSegmentSpec, export_tempo_mapped_midi
-from ..instrument_refinement.inference.render_compare import resolve_fluidsynth_executable
+from ..soundfont import (
+    FluidSynthRenderOptions,
+    RENDER_COMPARE_SPEED_PRESETS,
+    default_parallel_render_workers,
+    is_libfluidsynth_available,
+    render_midi_batch_to_stereo_arrays,
+    render_midi_to_stereo_array,
+    render_midi_with_fluidsynth,
+    resolve_signal_processing_device,
+    write_packed_smf_type0,
+)
 from ..velocity.render_compare_velocity import _merge_optimized_stem_midis
 
 # ドラム専用チャンネル (9) を除いた 15 本のメロディチャンネル（MIDI 16ch 制約準拠）。
@@ -183,6 +191,56 @@ class RenderCompareQuantizeConfig:
     verify_full_mix: bool = True
     write_tempo_map: bool = True
     max_melodic_instruments: int = 15
+    # True のとき、各ステムの 3 連符・32 分音符の出現頻度に応じて不要候補を省略し高速化する。
+    adaptive_candidates: bool = False
+    parallel_render_workers: int | None = None
+
+    @classmethod
+    def for_speed_preset(
+        cls,
+        soundfont_path: Path | str,
+        *,
+        speed: str = "balanced",
+        fluidsynth_executable: Path | str | None = None,
+        max_melodic_instruments: int = 15,
+        write_tempo_map: bool = False,
+        parallel_render_workers: int | None = None,
+    ) -> "RenderCompareQuantizeConfig":
+        """速度プリセット (`fast` / `balanced` / `quality`) から量子化設定を構築する。"""
+        normalized_speed = str(speed).strip().lower()
+        if normalized_speed not in RENDER_COMPARE_SPEED_PRESETS:
+            raise ValueError(f"speed must be one of {RENDER_COMPARE_SPEED_PRESETS}, got {speed!r}")
+        resolved_executable = Path(fluidsynth_executable) if fluidsynth_executable is not None else None
+        if normalized_speed == "fast":
+            return cls(
+                soundfont_path=Path(soundfont_path),
+                fluidsynth_executable=resolved_executable,
+                max_melodic_instruments=int(max_melodic_instruments),
+                write_tempo_map=bool(write_tempo_map),
+                verify_full_mix=False,
+                adaptive_candidates=True,
+                parallel_render_workers=parallel_render_workers,
+            )
+        if normalized_speed == "balanced":
+            # 並列実行では全 5 候補を評価しても時間差がごくわずかなため、精度維持のため全候補を残し検証パスのみ省略する。
+            return cls(
+                soundfont_path=Path(soundfont_path),
+                fluidsynth_executable=resolved_executable,
+                max_melodic_instruments=int(max_melodic_instruments),
+                write_tempo_map=bool(write_tempo_map),
+                verify_full_mix=False,
+                adaptive_candidates=False,
+                parallel_render_workers=parallel_render_workers,
+            )
+        return cls(
+            soundfont_path=Path(soundfont_path),
+            fluidsynth_executable=resolved_executable,
+            max_melodic_instruments=int(max_melodic_instruments),
+            write_tempo_map=bool(write_tempo_map),
+            verify_full_mix=True,
+            adaptive_candidates=False,
+            parallel_render_workers=parallel_render_workers,
+        )
 
     def __post_init__(self) -> None:
         if self.sample_rate <= 0:
@@ -283,33 +341,42 @@ def _compute_timing_features(
     """
     if waveform.size < n_fft:
         waveform = np.pad(waveform, (0, n_fft - waveform.size))
-    window = torch.hann_window(n_fft, dtype=torch.float32)
-    spectrum = torch.stft(
-        torch.from_numpy(waveform.astype(np.float32, copy=False)),
-        n_fft=n_fft,
-        hop_length=hop_length,
-        win_length=n_fft,
-        window=window,
-        center=True,
-        return_complex=True,
-    )
-    magnitude = spectrum.abs().numpy().astype(np.float32, copy=False)
-    power = np.square(magnitude)
-    log_magnitude = np.log1p(10.0 * magnitude)
+    signal_device = resolve_signal_processing_device()
+    with torch.inference_mode():
+        wave_tensor = torch.from_numpy(np.ascontiguousarray(waveform, dtype=np.float32)).to(signal_device)
+        window = torch.hann_window(n_fft, dtype=torch.float32, device=signal_device)
+        spectrum = torch.stft(
+            wave_tensor,
+            n_fft=n_fft,
+            hop_length=hop_length,
+            win_length=n_fft,
+            window=window,
+            center=True,
+            return_complex=True,
+        )
+        power_tensor = spectrum.real.square() + spectrum.imag.square()
+        log_magnitude = torch.log1p(10.0 * torch.sqrt(power_tensor.clamp_min(1e-12)))
 
-    # 1. 半波整流スペクトルフラックスを 4 帯域へ集約し、キック・スネア・コード・シンバルのアタックを捉える。
-    flux = np.maximum(0.0, np.diff(log_magnitude, axis=1, prepend=log_magnitude[:, :1]))
-    frequencies = np.linspace(0.0, float(sample_rate) * 0.5, magnitude.shape[0], dtype=np.float32)
-    band_edges = (0.0, 200.0, 800.0, 3200.0, float(sample_rate) * 0.5 + 1.0)
-    multiband_onset = np.zeros((4, flux.shape[1]), dtype=np.float32)
-    for band_index in range(4):
-        mask = (frequencies >= band_edges[band_index]) & (frequencies < band_edges[band_index + 1])
-        if np.any(mask):
-            multiband_onset[band_index] = flux[mask].mean(axis=0)
+        # 1. 半波整流スペクトルフラックスを 4 帯域へ集約し、キック・スネア・コード・シンバルのアタックを捉える。
+        flux = torch.zeros_like(log_magnitude)
+        if log_magnitude.shape[1] > 1:
+            flux[:, 1:] = torch.clamp_min(log_magnitude[:, 1:] - log_magnitude[:, :-1], 0.0)
+        frequencies = torch.linspace(
+            0.0, float(sample_rate) * 0.5, int(power_tensor.shape[0]), dtype=torch.float32, device=signal_device
+        )
+        band_edges = (0.0, 200.0, 800.0, 3200.0, float(sample_rate) * 0.5 + 1.0)
+        band_rows = []
+        for band_index in range(4):
+            mask = (frequencies >= band_edges[band_index]) & (frequencies < band_edges[band_index + 1])
+            if bool(mask.any().item()):
+                band_rows.append(flux[mask].mean(dim=0))
+            else:
+                band_rows.append(torch.zeros(flux.shape[1], dtype=torch.float32, device=signal_device))
+        multiband_onset = torch.stack(band_rows, dim=0).cpu().numpy()
 
-    # 2. ログメルスペクトログラム（持続音や和音チェンジの時間輪郭比較用）。
-    mel_power = mel_filterbank @ power
-    log_mel = np.log1p(10.0 * np.maximum(mel_power, 0.0)).astype(np.float32, copy=False)
+        # 2. ログメルスペクトログラム（持続音や和音チェンジの時間輪郭比較用）。
+        mel_tensor = torch.from_numpy(np.ascontiguousarray(mel_filterbank, dtype=np.float32)).to(signal_device)
+        log_mel = torch.log1p(10.0 * torch.clamp_min(mel_tensor @ power_tensor, 0.0)).cpu().numpy()
     frames_per_second = float(sample_rate) / float(hop_length)
     return multiband_onset, log_mel, frames_per_second
 
@@ -594,8 +661,28 @@ def _build_quantized_instrument_variant(
     必ず同一インデックス順で返す（小節合成時のノート取り違え・消失を構造上ゼロにする）。
     """
     ordered_source_notes = sorted(source_instrument.notes, key=lambda note: (note.start, note.pitch, note.end))
-    cloned = copy.deepcopy(source_instrument)
-    cloned.notes = copy.deepcopy(ordered_source_notes)
+    cloned = pretty_midi.Instrument(
+        program=int(source_instrument.program),
+        is_drum=bool(source_instrument.is_drum),
+        name=str(source_instrument.name),
+    )
+    cloned.notes = [
+        pretty_midi.Note(
+            velocity=int(note.velocity),
+            pitch=int(note.pitch),
+            start=float(note.start),
+            end=float(note.end),
+        )
+        for note in ordered_source_notes
+    ]
+    cloned.control_changes = [
+        pretty_midi.ControlChange(number=int(cc.number), value=int(cc.value), time=float(cc.time))
+        for cc in source_instrument.control_changes
+    ]
+    cloned.pitch_bends = [
+        pretty_midi.PitchBend(pitch=int(bend.pitch), time=float(bend.time))
+        for bend in source_instrument.pitch_bends
+    ]
     if candidate.subdivisions_per_beat <= 0 or candidate.strength <= 0.0 or not cloned.notes:
         timings = [(float(note.start), float(note.end)) for note in cloned.notes]
         return cloned, timings
@@ -788,17 +875,31 @@ def _assign_note_to_bar(
     *,
     boundary_margin_seconds: float,
 ) -> int:
-    """ノート開始時刻が属する小節インデックスを返す。
+    """ノート開始時刻が属する小節インデックスを二分探索 O(log B) で返す。
 
     次小節のダウンビート直前（boundary_margin_seconds 以内）のフライング音符は
     次小節の 1 拍目候補として次小節へ帰属させる。
     """
-    for index, (start_seconds, end_seconds) in enumerate(bar_windows):
-        if index + 1 < len(bar_windows) and abs(note_start_seconds - end_seconds) <= boundary_margin_seconds:
+    window_count = len(bar_windows)
+    # end_seconds < note_start_seconds - boundary_margin_seconds を満たす小節は
+    # フライング判定・区間包含判定のどちらも確実に偽となるため、二分探索で先頭候補まで飛ばす。
+    threshold = note_start_seconds - boundary_margin_seconds
+    low = 0
+    high = window_count
+    while low < high:
+        mid = (low + high) // 2
+        if bar_windows[mid][1] < threshold:
+            low = mid + 1
+        else:
+            high = mid
+
+    for index in range(low, window_count):
+        start_seconds, end_seconds = bar_windows[index]
+        if index + 1 < window_count and abs(note_start_seconds - end_seconds) <= boundary_margin_seconds:
             return index + 1
         if start_seconds <= note_start_seconds < end_seconds:
             return index
-    return len(bar_windows) - 1
+    return window_count - 1
 
 
 def _compute_window_timing_distance(
@@ -893,17 +994,8 @@ def _write_packed_variants_midi(
     output_midi_path: Path,
     slot_gap_seconds: float,
 ) -> list[_PackedVariantSlot]:
-    """複数スロット（ステム×候補やフルミックス）を 1 本の直列パック MIDI へ書き出す。
-
-    各スロットは (slot_key, stem_name, candidate_name, instruments, duration_seconds) のタプル。
-    1 回の FluidSynth 起動で全スロットを連続レンダリングできる。
-    """
-    midi_file = mido.MidiFile(ticks_per_beat=_PACKED_TICKS_PER_BEAT)
-    track = mido.MidiTrack()
-    midi_file.tracks.append(track)
-    events: list[tuple[int, int, mido.Message | mido.MetaMessage]] = [
-        (0, 0, mido.MetaMessage("set_tempo", tempo=_PACKED_TEMPO_MICROSECONDS, time=0))
-    ]
+    """複数スロット（ステム×候補やフルミックス）を 1 本の直列パック MIDI (SMF Type-0) へ高速書き出しする。"""
+    events: list[tuple[int, int, bytes]] = []
     slots: list[_PackedVariantSlot] = []
     cursor_seconds = 0.0
     melodic_channel_offset = 0
@@ -924,18 +1016,15 @@ def _write_packed_variants_midi(
 
             setup_tick = max(0, int(round(slot_start_seconds * _PACKED_TICKS_PER_SECOND)))
             if not instrument.is_drum:
-                events.append(
-                    (
-                        setup_tick,
-                        2,
-                        mido.Message("program_change", channel=channel, program=int(instrument.program), time=0),
-                    )
-                )
+                events.append((setup_tick, 2, bytes((0xC0 | channel, max(0, min(127, int(instrument.program)))))))
             volume_cc7 = next((int(control.value) for control in instrument.control_changes if int(control.number) == 7), 100)
-            events.append((setup_tick, 3, mido.Message("control_change", channel=channel, control=7, value=volume_cc7, time=0)))
-            events.append((setup_tick, 3, mido.Message("control_change", channel=channel, control=10, value=64, time=0)))
-            events.append((setup_tick, 3, mido.Message("control_change", channel=channel, control=11, value=127, time=0)))
+            cc_status = 0xB0 | channel
+            events.append((setup_tick, 3, bytes((cc_status, 7, max(0, min(127, volume_cc7))))))
+            events.append((setup_tick, 3, bytes((cc_status, 10, 64))))
+            events.append((setup_tick, 3, bytes((cc_status, 11, 127))))
 
+            note_on_status = 0x90 | channel
+            note_off_status = 0x80 | channel
             for note in instrument.notes:
                 start_tick = max(
                     setup_tick,
@@ -946,14 +1035,16 @@ def _write_packed_variants_midi(
                     int(round((slot_start_seconds + max(float(note.start) + 0.02, float(note.end))) * _PACKED_TICKS_PER_SECOND)),
                 )
                 velocity = max(1, min(127, int(round(note.velocity))))
-                events.append((start_tick, 5, mido.Message("note_on", channel=channel, note=int(note.pitch), velocity=velocity, time=0)))
-                events.append((end_tick, 4, mido.Message("note_off", channel=channel, note=int(note.pitch), velocity=0, time=0)))
+                pitch = max(0, min(127, int(note.pitch)))
+                events.append((start_tick, 5, bytes((note_on_status, pitch, velocity))))
+                events.append((end_tick, 4, bytes((note_off_status, pitch, 0))))
 
         slot_end_seconds = slot_start_seconds + float(duration_seconds)
         stop_tick = int(round((slot_end_seconds + 0.04) * _PACKED_TICKS_PER_SECOND))
         for channel in sorted(used_channels):
-            events.append((stop_tick, 6, mido.Message("control_change", channel=channel, control=123, value=0, time=0)))
-            events.append((stop_tick, 6, mido.Message("control_change", channel=channel, control=120, value=0, time=0)))
+            cc_status = 0xB0 | channel
+            events.append((stop_tick, 6, bytes((cc_status, 123, 0))))
+            events.append((stop_tick, 6, bytes((cc_status, 120, 0))))
 
         slots.append(
             _PackedVariantSlot(
@@ -967,15 +1058,12 @@ def _write_packed_variants_midi(
         melodic_channel_offset = (melodic_channel_offset + max(1, local_melodic_index)) % len(_MELODIC_MIDI_CHANNELS)
         cursor_seconds = slot_end_seconds + float(slot_gap_seconds)
 
-    events.sort(key=lambda item: (item[0], item[1]))
-    previous_tick = 0
-    for tick, _priority, message in events:
-        track.append(message.copy(time=max(0, tick - previous_tick)))
-        previous_tick = tick
-    track.append(mido.MetaMessage("end_of_track", time=0))
-
-    output_midi_path.parent.mkdir(parents=True, exist_ok=True)
-    midi_file.save(str(output_midi_path))
+    write_packed_smf_type0(
+        output_midi_path,
+        events,
+        ticks_per_beat=_PACKED_TICKS_PER_BEAT,
+        tempo_microseconds=_PACKED_TEMPO_MICROSECONDS,
+    )
     return slots
 
 
@@ -986,30 +1074,61 @@ def _render_packed_midi_with_fluidsynth(
     *,
     config: RenderCompareQuantizeConfig,
 ) -> None:
-    """FluidSynth を 1 回だけ起動してパック MIDI を WAV へレンダリングする。"""
-    executable = resolve_fluidsynth_executable(config.fluidsynth_executable)
-    command = [
-        str(executable),
-        "-ni",
-        "-T",
-        "wav",
-        "-F",
-        str(wav_path),
-        "-r",
-        str(int(sample_rate)),
-        "-g",
-        f"{float(config.render_gain):.3f}",
-        "-R",
-        "0" if config.disable_reverb else "1",
-        "-C",
-        "0" if config.disable_chorus else "1",
-        str(Path(config.soundfont_path)),
-        str(midi_path),
+    """FluidSynth を起動してパック MIDI を WAV へレンダリングする。"""
+    render_midi_with_fluidsynth(
+        midi_path,
+        wav_path,
+        options=FluidSynthRenderOptions(
+            soundfont_path=Path(config.soundfont_path),
+            sample_rate=int(sample_rate),
+            fluidsynth_executable=config.fluidsynth_executable,
+            render_gain=float(config.render_gain),
+            disable_reverb=bool(config.disable_reverb),
+            disable_chorus=bool(config.disable_chorus),
+            polyphony=64,
+        ),
+    )
+
+
+def _select_adaptive_candidates_for_stem(
+    midi_object: pretty_midi.PrettyMIDI,
+    beat_times: np.ndarray,
+    candidates: Sequence[_QuantizeCandidateSpec],
+) -> list[_QuantizeCandidateSpec]:
+    """ステム内の拍内オンセット分布から、3連符 (`subdivisions=3`) と 32分音符 (`subdivisions=8`) の必要性を判定する。"""
+    note_starts = [
+        float(note.start)
+        for instrument in midi_object.instruments
+        for note in instrument.notes
     ]
-    completed = subprocess.run(command, capture_output=True, text=True, check=False)
-    if completed.returncode != 0 or not wav_path.is_file():
-        stderr_tail = (completed.stderr or completed.stdout or "").strip()[-800:]
-        raise RuntimeError(f"FluidSynth failed with exit code {completed.returncode}: {stderr_tail}")
+    if len(note_starts) < 8 or beat_times.size < 2:
+        return [candidate for candidate in candidates if candidate.subdivisions_per_beat in (0, 4)]
+
+    triplet_hits = 0
+    fine_32nd_hits = 0
+    for start_seconds in note_starts:
+        beat_position, _ = _seconds_to_beat_position(start_seconds, beat_times)
+        fraction = beat_position - math.floor(beat_position)
+        distance_to_16th = min(abs(fraction - step) for step in (0.0, 0.25, 0.5, 0.75, 1.0))
+        distance_to_triplet = min(abs(fraction - (1.0 / 3.0)), abs(fraction - (2.0 / 3.0)))
+        if distance_to_triplet <= 0.065 and distance_to_triplet + 0.015 < distance_to_16th:
+            triplet_hits += 1
+        distance_to_odd_32nd = min(abs(fraction - step) for step in (0.125, 0.375, 0.625, 0.875))
+        if distance_to_odd_32nd <= 0.045 and distance_to_odd_32nd + 0.015 < distance_to_16th:
+            fine_32nd_hits += 1
+
+    total_notes = float(len(note_starts))
+    needs_triplet = triplet_hits >= 6 and (float(triplet_hits) / total_notes) >= 0.10
+    needs_fine_32nd = fine_32nd_hits >= 8 and (float(fine_32nd_hits) / total_notes) >= 0.12
+
+    selected: list[_QuantizeCandidateSpec] = []
+    for candidate in candidates:
+        if candidate.subdivisions_per_beat == 3 and not needs_triplet:
+            continue
+        if candidate.subdivisions_per_beat >= 8 and not needs_fine_32nd:
+            continue
+        selected.append(candidate)
+    return selected or list(candidates[:1])
 
 
 def _assemble_stem_midi_from_bar_choices(
@@ -1068,9 +1187,12 @@ def _assemble_stem_midi_from_bar_choices(
             bar_index = note_bar_indices[note_position]
             chosen_name = candidate_names[selected_candidate_by_bar[bar_index]]
             chosen_start, chosen_end = variant_timings_by_candidate[chosen_name][instrument_index][note_position]
-            rebuilt = copy.deepcopy(original_note)
-            rebuilt.start = float(chosen_start)
-            rebuilt.end = float(chosen_end)
+            rebuilt = pretty_midi.Note(
+                velocity=int(original_note.velocity),
+                pitch=int(original_note.pitch),
+                start=float(chosen_start),
+                end=float(chosen_end),
+            )
             original_starts_by_id[id(rebuilt)] = float(original_note.start)
             shift_ms = abs(float(chosen_start) - float(original_note.start)) * 1000.0
             if shift_ms >= 0.5:
@@ -1098,11 +1220,18 @@ def quantize_stems_by_render_compare(
     output_stem_dir: Path | str | None = None,
     candidates: Sequence[_QuantizeCandidateSpec] = DEFAULT_QUANTIZE_CANDIDATES,
     packed_midi_renderer: _PackedMidiRenderer | None = None,
+    preloaded_waveforms: Mapping[str, np.ndarray] | None = None,
+    preloaded_full_mix: np.ndarray | None = None,
 ) -> dict[str, Any]:
     """全ステム MIDI をビート情報と Render & Compare によって小節単位で最適量子化する。"""
     sample_rate = int(config.sample_rate)
     resolved_midis = {str(name).lower(): Path(path) for name, path in stem_midis.items() if Path(path).is_file()}
     resolved_audios = {str(name).lower(): Path(path) for name, path in stem_audios.items() if Path(path).is_file()}
+    preloaded_normalized = (
+        {str(name).lower(): np.asarray(wave, dtype=np.float32) for name, wave in preloaded_waveforms.items()}
+        if preloaded_waveforms is not None
+        else {}
+    )
     active_stems = sorted(set(resolved_midis) & set(resolved_audios))
     if not active_stems:
         raise ValueError("No matching stem MIDI and audio pairs were found.")
@@ -1136,7 +1265,11 @@ def quantize_stems_by_render_compare(
         if not midi_object.instruments:
             continue
 
-        mono_audio = _load_mono_audio(resolved_audios[stem_name], target_sample_rate=sample_rate)
+        mono_audio = (
+            preloaded_normalized[stem_name]
+            if stem_name in preloaded_normalized
+            else _load_mono_audio(resolved_audios[stem_name], target_sample_rate=sample_rate)
+        )
         original_midis[stem_name] = midi_object
         target_waveforms[stem_name] = mono_audio
         stem_durations[stem_name] = max(0.25, float(mono_audio.size) / float(sample_rate))
@@ -1147,7 +1280,9 @@ def quantize_stems_by_render_compare(
 
     max_duration_seconds = max(stem_durations.values())
     max_samples = max(int(wave.size) for wave in target_waveforms.values())
-    if original_mix_audio is not None and Path(original_mix_audio).is_file():
+    if preloaded_full_mix is not None:
+        target_full_mix = np.asarray(preloaded_full_mix, dtype=np.float32)
+    elif original_mix_audio is not None and Path(original_mix_audio).is_file():
         target_full_mix = _load_mono_audio(Path(original_mix_audio), target_sample_rate=sample_rate)
     else:
         target_full_mix = np.zeros(max_samples, dtype=np.float32)
@@ -1172,19 +1307,25 @@ def quantize_stems_by_render_compare(
     beat_times_array = np.asarray(aligned_beat_grid.beat_times, dtype=np.float64)
     bar_windows = _build_bar_windows(aligned_beat_grid, max_duration_seconds)
 
-    # 3. 各ステム × 各量子化候補の MIDI を生成する。
-    candidate_names = [candidate.name for candidate in candidates]
-    if candidate_names[0] != "original":
+    # 3. 各ステム × 各量子化候補の MIDI を生成する（adaptive_candidates 有効時は不要候補を省略）。
+    if not candidates or candidates[0].name != "original":
         raise ValueError("First quantize candidate must be 'original'")
 
+    candidates_by_stem: dict[str, list[_QuantizeCandidateSpec]] = {}
     variants_by_stem: dict[str, dict[str, pretty_midi.PrettyMIDI]] = {}
     variant_timings_by_stem: dict[str, dict[str, list[list[tuple[float, float]]]]] = {}
     for stem_name in stems_with_notes:
         base_midi = original_midis[stem_name]
+        stem_candidates = (
+            _select_adaptive_candidates_for_stem(base_midi, beat_times_array, candidates)
+            if config.adaptive_candidates
+            else list(candidates)
+        )
+        candidates_by_stem[stem_name] = stem_candidates
         variants_by_stem[stem_name] = {}
         variant_timings_by_stem[stem_name] = {}
-        for candidate in candidates:
-            variant_midi = copy.deepcopy(base_midi)
+        for candidate in stem_candidates:
+            variant_midi = pretty_midi.PrettyMIDI()
             new_instruments: list[pretty_midi.Instrument] = []
             instrument_timings: list[list[tuple[float, float]]] = []
             for instrument in base_midi.instruments:
@@ -1200,7 +1341,7 @@ def quantize_stems_by_render_compare(
             variants_by_stem[stem_name][candidate.name] = variant_midi
             variant_timings_by_stem[stem_name][candidate.name] = instrument_timings
 
-    # 4. 全ステム × 全候補を 1 本のパック MIDI に詰め、FluidSynth を 1 回起動してレンダリングする。
+    # 4. 全ステム × 候補をレンダリングする（本番 FluidSynth 実行時はステム単位でマルチコア並列実行）。
     mel_filterbank = _build_mel_filterbank(sample_rate=sample_rate)
     target_features_by_stem: dict[str, tuple[np.ndarray, np.ndarray, float]] = {}
     for stem_name in stems_with_notes:
@@ -1210,20 +1351,19 @@ def quantize_stems_by_render_compare(
             mel_filterbank=mel_filterbank,
         )
 
-    slot_specs: list[tuple[str, str, str, Sequence[pretty_midi.Instrument], float]] = []
+    slot_specs_by_stem: dict[str, list[tuple[str, str, str, Sequence[pretty_midi.Instrument], float]]] = {}
     for stem_name in stems_with_notes:
         duration_seconds = stem_durations[stem_name]
-        for candidate in candidates:
-            slot_key = f"{stem_name}::{candidate.name}"
-            slot_specs.append(
-                (
-                    slot_key,
-                    stem_name,
-                    candidate.name,
-                    variants_by_stem[stem_name][candidate.name].instruments,
-                    duration_seconds,
-                )
+        slot_specs_by_stem[stem_name] = [
+            (
+                f"{stem_name}::{candidate.name}",
+                stem_name,
+                candidate.name,
+                variants_by_stem[stem_name][candidate.name].instruments,
+                duration_seconds,
             )
+            for candidate in candidates_by_stem[stem_name]
+        ]
 
     assembled_midis: dict[str, pretty_midi.PrettyMIDI] = {}
     stem_reports: dict[str, dict[str, Any]] = {}
@@ -1231,42 +1371,127 @@ def quantize_stems_by_render_compare(
 
     with tempfile.TemporaryDirectory(prefix="tsumugi_rc_quantize_") as temp_directory:
         temp_root = Path(temp_directory)
-        candidates_midi_path = temp_root / "candidates_packed.mid"
-        candidates_wav_path = temp_root / "candidates_packed.wav"
-        slots = _write_packed_variants_midi(
-            slot_specs,
-            output_midi_path=candidates_midi_path,
-            slot_gap_seconds=float(config.slot_gap_seconds),
+        rendered_segments_by_key: dict[str, np.ndarray] = {}
+        use_fine_grained_parallel = packed_midi_renderer is None and is_libfluidsynth_available(
+            config.fluidsynth_executable
         )
-        if packed_midi_renderer is not None:
-            packed_midi_renderer(candidates_midi_path, candidates_wav_path, sample_rate)
-        else:
-            _render_packed_midi_with_fluidsynth(
-                candidates_midi_path,
-                candidates_wav_path,
-                sample_rate,
-                config=config,
+        total_slot_count = sum(len(slot_specs_by_stem[stem_name]) for stem_name in stems_with_notes)
+        parallel_job_count = total_slot_count if use_fine_grained_parallel else len(stems_with_notes)
+        parallel_workers = (
+            default_parallel_render_workers(
+                Path(config.soundfont_path),
+                parallel_job_count,
+                max_workers=config.parallel_render_workers,
             )
+            if packed_midi_renderer is None
+            else 1
+        )
 
-        rendered_audio, rendered_rate = sf.read(str(candidates_wav_path), dtype="float32", always_2d=True)
-        if int(rendered_rate) != sample_rate:
-            raise ValueError(f"Rendered sample rate mismatch: expected {sample_rate}, got {rendered_rate}")
-        rendered_mono = rendered_audio.mean(axis=1).astype(np.float32, copy=False)
+        render_options = FluidSynthRenderOptions(
+            soundfont_path=Path(config.soundfont_path),
+            sample_rate=sample_rate,
+            fluidsynth_executable=config.fluidsynth_executable,
+            render_gain=float(config.render_gain),
+            disable_reverb=bool(config.disable_reverb),
+            disable_chorus=bool(config.disable_chorus),
+            polyphony=64,
+        )
 
-        # 5. 各ステム・各小節ごとに音響タイミング距離を計測し、Viterbi で最適候補列を選択する。
-        slots_by_key = {slot.slot_key: slot for slot in slots}
-        for stem_name in stems_with_notes:
-            target_onset, target_mel, frames_per_second = target_features_by_stem[stem_name]
-            expected_samples = int(target_waveforms[stem_name].size)
-            num_target_frames = int(target_onset.shape[1])
-
-            rendered_features_by_candidate: dict[str, tuple[np.ndarray, np.ndarray]] = {}
-            for candidate_name in candidate_names:
-                slot = slots_by_key[f"{stem_name}::{candidate_name}"]
+        if parallel_workers <= 1 or parallel_job_count <= 1:
+            all_slot_specs = [spec for stem_name in stems_with_notes for spec in slot_specs_by_stem[stem_name]]
+            candidates_midi_path = temp_root / "candidates_packed.mid"
+            slots = _write_packed_variants_midi(
+                all_slot_specs,
+                output_midi_path=candidates_midi_path,
+                slot_gap_seconds=float(config.slot_gap_seconds),
+            )
+            if packed_midi_renderer is not None:
+                candidates_wav_path = temp_root / "candidates_packed.wav"
+                packed_midi_renderer(candidates_midi_path, candidates_wav_path, sample_rate)
+                rendered_audio, rendered_rate = sf.read(str(candidates_wav_path), dtype="float32", always_2d=True)
+                if int(rendered_rate) != sample_rate:
+                    raise ValueError(f"Rendered sample rate mismatch: expected {sample_rate}, got {rendered_rate}")
+                rendered_mono = rendered_audio.mean(axis=1).astype(np.float32, copy=False)
+            else:
+                rendered_stereo = render_midi_to_stereo_array(candidates_midi_path, options=render_options)
+                rendered_mono = rendered_stereo.mean(axis=0).astype(np.float32, copy=False)
+            for slot in slots:
+                expected_samples = int(target_waveforms[slot.stem_name].size)
                 start_sample = max(0, int(round(slot.slot_start_seconds * sample_rate)))
                 segment = rendered_mono[start_sample : min(rendered_mono.size, start_sample + expected_samples)]
                 if segment.size < expected_samples:
                     segment = np.pad(segment, (0, expected_samples - segment.size))
+                rendered_segments_by_key[slot.slot_key] = segment
+        elif use_fine_grained_parallel:
+            # 常駐 libfluidsynth では SF2 再読込コストがゼロのため、(ステム × 候補) 単位で細粒度並列化する。
+            # ノート数が多い重い候補（例: other の 5 候補）から先に投入する LPT スケジューリングにより、
+            # 最大 4 ワーカーの範囲内でコア間の待ち偏りを抑えて高速化する。
+            ordered_slot_specs = sorted(
+                (spec for stem_name in stems_with_notes for spec in slot_specs_by_stem[stem_name]),
+                key=lambda spec: (-sum(len(instrument.notes) for instrument in spec[3]), spec[0]),
+            )
+            slot_midi_paths: list[Path] = []
+            slot_metadata: list[tuple[str, str]] = []
+            for slot_index, slot_spec in enumerate(ordered_slot_specs):
+                slot_midi_path = temp_root / f"quantize_slot_{slot_index}.mid"
+                _write_packed_variants_midi(
+                    [slot_spec],
+                    output_midi_path=slot_midi_path,
+                    slot_gap_seconds=0.0,
+                )
+                slot_midi_paths.append(slot_midi_path)
+                slot_metadata.append((slot_spec[0], slot_spec[1]))
+
+            rendered_stereo_list = render_midi_batch_to_stereo_arrays(
+                slot_midi_paths,
+                options=render_options,
+                max_workers=parallel_workers,
+            )
+            for (slot_key, stem_name), rendered_stereo in zip(slot_metadata, rendered_stereo_list):
+                rendered_mono = rendered_stereo.mean(axis=0).astype(np.float32, copy=False)
+                expected_samples = int(target_waveforms[stem_name].size)
+                segment = rendered_mono[:expected_samples]
+                if segment.size < expected_samples:
+                    segment = np.pad(segment, (0, expected_samples - segment.size))
+                rendered_segments_by_key[slot_key] = segment
+        else:
+            stem_midi_paths: list[Path] = []
+            stem_job_metadata: list[tuple[str, list[_PackedVariantSlot]]] = []
+            for stem_index, stem_name in enumerate(stems_with_notes):
+                stem_midi_path = temp_root / f"quantize_stem_{stem_index}.mid"
+                stem_slots = _write_packed_variants_midi(
+                    slot_specs_by_stem[stem_name],
+                    output_midi_path=stem_midi_path,
+                    slot_gap_seconds=float(config.slot_gap_seconds),
+                )
+                stem_midi_paths.append(stem_midi_path)
+                stem_job_metadata.append((stem_name, stem_slots))
+
+            rendered_stereo_list = render_midi_batch_to_stereo_arrays(
+                stem_midi_paths,
+                options=render_options,
+                max_workers=parallel_workers,
+            )
+            for (stem_name, stem_slots), rendered_stereo in zip(stem_job_metadata, rendered_stereo_list):
+                rendered_mono = rendered_stereo.mean(axis=0).astype(np.float32, copy=False)
+                expected_samples = int(target_waveforms[stem_name].size)
+                for slot in stem_slots:
+                    start_sample = max(0, int(round(slot.slot_start_seconds * sample_rate)))
+                    segment = rendered_mono[start_sample : min(rendered_mono.size, start_sample + expected_samples)]
+                    if segment.size < expected_samples:
+                        segment = np.pad(segment, (0, expected_samples - segment.size))
+                    rendered_segments_by_key[slot.slot_key] = segment
+
+        # 5. 各ステム・各小節ごとに音響タイミング距離を計測し、Viterbi で最適候補列を選択する。
+        for stem_name in stems_with_notes:
+            stem_candidates = candidates_by_stem[stem_name]
+            stem_candidate_names = [candidate.name for candidate in stem_candidates]
+            target_onset, target_mel, frames_per_second = target_features_by_stem[stem_name]
+            num_target_frames = int(target_onset.shape[1])
+
+            rendered_features_by_candidate: dict[str, tuple[np.ndarray, np.ndarray]] = {}
+            for candidate_name in stem_candidate_names:
+                segment = rendered_segments_by_key[f"{stem_name}::{candidate_name}"]
                 candidate_onset, candidate_mel, _ = _compute_timing_features(
                     segment,
                     sample_rate=sample_rate,
@@ -1274,7 +1499,7 @@ def quantize_stems_by_render_compare(
                 )
                 rendered_features_by_candidate[candidate_name] = (candidate_onset, candidate_mel)
 
-            raw_distances = np.zeros((len(bar_windows), len(candidates)), dtype=np.float64)
+            raw_distances = np.zeros((len(bar_windows), len(stem_candidates)), dtype=np.float64)
             bar_note_counts = np.zeros(len(bar_windows), dtype=np.int32)
             for instrument in original_midis[stem_name].instruments:
                 for note in instrument.notes:
@@ -1292,7 +1517,7 @@ def quantize_stems_by_render_compare(
                 window_end = min(stem_durations[stem_name], bar_end + float(config.bar_boundary_margin_seconds))
                 start_frame = max(0, min(num_target_frames - 2, int(math.floor(window_start * frames_per_second))))
                 end_frame = min(num_target_frames, max(start_frame + 2, int(math.ceil(window_end * frames_per_second))))
-                for candidate_index, candidate_name in enumerate(candidate_names):
+                for candidate_index, candidate_name in enumerate(stem_candidate_names):
                     candidate_onset, candidate_mel = rendered_features_by_candidate[candidate_name]
                     common_end = min(end_frame, int(candidate_onset.shape[1]))
                     if common_end <= start_frame + 1:
@@ -1311,7 +1536,7 @@ def quantize_stems_by_render_compare(
             is_vocal_stem = "vocal" in stem_name
             prior_costs = [
                 float(candidate.vocal_prior_cost if is_vocal_stem else candidate.prior_cost)
-                for candidate in candidates
+                for candidate in stem_candidates
             ]
             selected_by_bar = _decode_viterbi_candidate_sequence(
                 raw_distances,
@@ -1327,7 +1552,7 @@ def quantize_stems_by_render_compare(
             assembled_midi, moved_notes, mean_shift_ms = _assemble_stem_midi_from_bar_choices(
                 original_midis[stem_name],
                 variant_timings_by_stem[stem_name],
-                candidate_names,
+                stem_candidate_names,
                 selected_by_bar,
                 bar_windows,
                 config=config,
@@ -1345,7 +1570,7 @@ def quantize_stems_by_render_compare(
             )
             choice_counts = {
                 candidate_name: int(sum(1 for index in active_bars if selected_by_bar[index] == candidate_index))
-                for candidate_index, candidate_name in enumerate(candidate_names)
+                for candidate_index, candidate_name in enumerate(stem_candidate_names)
             }
             total_notes = sum(len(instrument.notes) for instrument in original_midis[stem_name].instruments)
             stem_reports[stem_name] = {
@@ -1374,7 +1599,6 @@ def quantize_stems_by_render_compare(
                 if instrument.notes
             ]
             verify_midi_path = temp_root / "verify_full_mix.mid"
-            verify_wav_path = temp_root / "verify_full_mix.wav"
             verify_slots = _write_packed_variants_midi(
                 [
                     ("before_full_mix", "__full_mix__", "original", before_all_instruments, max_duration_seconds),
@@ -1384,17 +1608,13 @@ def quantize_stems_by_render_compare(
                 slot_gap_seconds=float(config.slot_gap_seconds),
             )
             if packed_midi_renderer is not None:
+                verify_wav_path = temp_root / "verify_full_mix.wav"
                 packed_midi_renderer(verify_midi_path, verify_wav_path, sample_rate)
+                verify_audio, _ = sf.read(str(verify_wav_path), dtype="float32", always_2d=True)
+                verify_mono = verify_audio.mean(axis=1).astype(np.float32, copy=False)
             else:
-                _render_packed_midi_with_fluidsynth(
-                    verify_midi_path,
-                    verify_wav_path,
-                    sample_rate,
-                    config=config,
-                )
-
-            verify_audio, _ = sf.read(str(verify_wav_path), dtype="float32", always_2d=True)
-            verify_mono = verify_audio.mean(axis=1).astype(np.float32, copy=False)
+                verify_stereo = render_midi_to_stereo_array(verify_midi_path, options=render_options)
+                verify_mono = verify_stereo.mean(axis=0).astype(np.float32, copy=False)
             target_mix_onset, target_mix_mel, frames_per_second = _compute_timing_features(
                 target_full_mix,
                 sample_rate=sample_rate,

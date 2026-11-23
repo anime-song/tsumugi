@@ -22,8 +22,10 @@ from typing import Any
 
 import numpy as np
 import pretty_midi
+import scipy.sparse
 import torch
 
+from ..soundfont import resolve_signal_processing_device
 from .render_compare_velocity import _apply_k_weighting, _build_harmonic_pitch_filterbank
 
 # 発音中の強弱変化（クレッシェンド・デクレッシェンド・スウェル）が意味を持つ持続系 GM プログラム群。
@@ -132,30 +134,35 @@ def _compute_channel_power_maps(
         left_k = np.pad(left_k, (0, pad))
         right_k = np.pad(right_k, (0, pad))
 
-    window = torch.hann_window(n_fft, dtype=torch.float32)
-    window_energy = float(window.square().sum().item())
-    batch_wave = torch.from_numpy(np.stack((left_k, right_k), axis=0))
-    spectrum = torch.stft(
-        batch_wave,
-        n_fft=n_fft,
-        hop_length=hop_length,
-        win_length=n_fft,
-        window=window,
-        center=True,
-        return_complex=True,
-    )
-    power_lr = (spectrum.real.square() + spectrum.imag.square()).numpy() / max(window_energy, 1e-8)
+    signal_device = resolve_signal_processing_device()
+    with torch.inference_mode():
+        window = torch.hann_window(n_fft, dtype=torch.float32, device=signal_device)
+        window_energy = float(window.square().sum().item())
+        batch_wave = torch.from_numpy(np.ascontiguousarray(np.stack((left_k, right_k), axis=0), dtype=np.float32)).to(
+            signal_device
+        )
+        spectrum = torch.stft(
+            batch_wave,
+            n_fft=n_fft,
+            hop_length=hop_length,
+            win_length=n_fft,
+            window=window,
+            center=True,
+            return_complex=True,
+        )
+        power_lr = (spectrum.real.square() + spectrum.imag.square()) / max(window_energy, 1e-8)
 
-    broadband_weights = np.full(power_lr.shape[1], 2.0, dtype=np.float32)
-    broadband_weights[0] = 1.0
-    if n_fft % 2 == 0:
-        broadband_weights[-1] = 1.0
-    left_broadband = (broadband_weights @ power_lr[0]) / float(n_fft)
-    right_broadband = (broadband_weights @ power_lr[1]) / float(n_fft)
-    mono_broadband = 0.5 * (left_broadband + right_broadband)
+        broadband_weights = torch.full((power_lr.shape[1],), 2.0, dtype=torch.float32, device=signal_device)
+        broadband_weights[0] = 1.0
+        if n_fft % 2 == 0:
+            broadband_weights[-1] = 1.0
+        left_broadband = ((broadband_weights @ power_lr[0]) / float(n_fft)).cpu().numpy()
+        right_broadband = ((broadband_weights @ power_lr[1]) / float(n_fft)).cpu().numpy()
+        mono_broadband = 0.5 * (left_broadband + right_broadband)
 
-    left_pitch = pitch_filterbank @ power_lr[0]
-    right_pitch = pitch_filterbank @ power_lr[1]
+        pitch_fb_tensor = torch.from_numpy(np.ascontiguousarray(pitch_filterbank, dtype=np.float32)).to(signal_device)
+        left_pitch = (pitch_fb_tensor @ power_lr[0]).cpu().numpy()
+        right_pitch = (pitch_fb_tensor @ power_lr[1]).cpu().numpy()
     return left_broadband, right_broadband, mono_broadband, left_pitch, right_pitch
 
 
@@ -409,7 +416,7 @@ def _extract_track_expression_events(
 
         if emitted_in_phrase:
             modulated_phrase_count += 1
-            # CC#11 による平均音量低下分を Note-On Velocity 側でわずかに補償し、1-B のミックスバランスを保つ。
+            # CC#11 による平均音量低下分を Note-On Velocity 側でわずかに補償し、トラック間のミックスバランスを保つ。
             if config.compensate_velocity_for_expression:
                 mean_ratio = float(np.mean(cc11_curve)) / 127.0
                 if 0.1 < mean_ratio < 0.98:
@@ -520,28 +527,35 @@ def split_stereo_pan_tracks_in_stem_midi(
         raise ValueError(f"Expected stereo audio with shape [2, T], got {stereo_float.shape}")
     if int(stereo_float.shape[1]) < n_fft:
         stereo_float = np.pad(stereo_float, ((0, 0), (0, n_fft - int(stereo_float.shape[1]))))
-    window = torch.hann_window(n_fft, dtype=torch.float32)
-    window_energy = float(window.square().sum().item())
-    stereo_spectrum = torch.stft(
-        torch.from_numpy(stereo_float),
-        n_fft=n_fft,
-        hop_length=hop_length,
-        win_length=n_fft,
-        window=window,
-        center=True,
-        return_complex=True,
-    )
-    left_real = stereo_spectrum[0].real.numpy()
-    left_imag = stereo_spectrum[0].imag.numpy()
-    right_real = stereo_spectrum[1].real.numpy()
-    right_imag = stereo_spectrum[1].imag.numpy()
-    left_power = (left_real * left_real + left_imag * left_imag) / max(window_energy, 1e-8)
-    right_power = (right_real * right_real + right_imag * right_imag) / max(window_energy, 1e-8)
-    cross_real_power = (left_real * right_real + left_imag * right_imag) / max(window_energy, 1e-8)
+    signal_device = resolve_signal_processing_device()
+    with torch.inference_mode():
+        window = torch.hann_window(n_fft, dtype=torch.float32, device=signal_device)
+        window_energy = float(window.square().sum().item())
+        stereo_tensor = torch.from_numpy(np.ascontiguousarray(stereo_float, dtype=np.float32)).to(signal_device)
+        stereo_spectrum = torch.stft(
+            stereo_tensor,
+            n_fft=n_fft,
+            hop_length=hop_length,
+            win_length=n_fft,
+            window=window,
+            center=True,
+            return_complex=True,
+        )
+        inv_win_energy = 1.0 / max(window_energy, 1e-8)
+        left_real = stereo_spectrum[0].real
+        left_imag = stereo_spectrum[0].imag
+        right_real = stereo_spectrum[1].real
+        right_imag = stereo_spectrum[1].imag
+        left_power = (left_real.square() + left_imag.square()) * inv_win_energy
+        right_power = (right_real.square() + right_imag.square()) * inv_win_energy
+        cross_real_power = (left_real * right_real + left_imag * right_imag) * inv_win_energy
 
-    left_pitch = harmonic_filterbank @ left_power
-    right_pitch = harmonic_filterbank @ right_power
-    cross_pitch = harmonic_filterbank @ cross_real_power
+        harmonic_fb_tensor = torch.from_numpy(np.ascontiguousarray(harmonic_filterbank, dtype=np.float32)).to(
+            signal_device
+        )
+        left_pitch = (harmonic_fb_tensor @ left_power).cpu().numpy()
+        right_pitch = (harmonic_fb_tensor @ right_power).cpu().numpy()
+        cross_pitch = (harmonic_fb_tensor @ cross_real_power).cpu().numpy()
     num_frames = int(left_pitch.shape[1])
 
     def _decode_zone_labels(
@@ -551,24 +565,47 @@ def split_stereo_pan_tracks_in_stem_midi(
         allow_center: bool,
     ) -> np.ndarray:
         """旋律・和音グラフ上の平均場ラベル伝播（8 反復）で時間的に安定したゾーン列 {0:L, 1:C, 2:R} を求める。"""
+        node_count = int(unary_scores.shape[0])
         effective_unary = unary_scores.copy()
         if not allow_center:
             effective_unary[:, 1] = -1e6
+
+        # 隣接リストを疎行列 CSR へ一度だけ変換し、8 反復のメッセージ集約を疎行列積 (SpMV) で一括計算する。
+        row_indices: list[int] = []
+        column_indices: list[int] = []
+        edge_weights: list[float] = []
+        for node_index, edges in enumerate(neighbor_edges):
+            for neighbor_index, edge_weight in edges:
+                row_indices.append(node_index)
+                column_indices.append(neighbor_index)
+                edge_weights.append(edge_weight)
+        adjacency = scipy.sparse.csr_matrix(
+            (
+                np.asarray(edge_weights, dtype=np.float64),
+                (np.asarray(row_indices, dtype=np.int32), np.asarray(column_indices, dtype=np.int32)),
+            ),
+            shape=(node_count, node_count),
+        )
+
         beliefs = effective_unary.copy()
         for _ in range(8):
             shifted = beliefs - beliefs.max(axis=1, keepdims=True)
             probabilities = np.exp(shifted * 1.5)
             probabilities /= np.maximum(probabilities.sum(axis=1, keepdims=True), 1e-12)
-            next_beliefs = effective_unary.copy()
-            for node_index in range(effective_unary.shape[0]):
-                accumulated = np.zeros(3, dtype=np.float64)
-                for neighbor_index, edge_weight in neighbor_edges[node_index]:
-                    accumulated += edge_weight * probabilities[neighbor_index]
-                next_beliefs[node_index] = effective_unary[node_index] + 0.85 * accumulated
+            accumulated = adjacency @ probabilities
+            next_beliefs = effective_unary + 0.85 * accumulated
             if not allow_center:
                 next_beliefs[:, 1] = -1e6
             beliefs = next_beliefs
         return beliefs.argmax(axis=1)
+
+    # ノート区間平均を O(1) で引くための累積和テーブル [num_pitches, num_frames + 1] (float64) を事前構築する。
+    left_prefix = np.zeros((left_pitch.shape[0], num_frames + 1), dtype=np.float64)
+    right_prefix = np.zeros((right_pitch.shape[0], num_frames + 1), dtype=np.float64)
+    cross_prefix = np.zeros((cross_pitch.shape[0], num_frames + 1), dtype=np.float64)
+    np.cumsum(left_pitch, axis=1, dtype=np.float64, out=left_prefix[:, 1:])
+    np.cumsum(right_pitch, axis=1, dtype=np.float64, out=right_prefix[:, 1:])
+    np.cumsum(cross_pitch, axis=1, dtype=np.float64, out=cross_prefix[:, 1:])
 
     # 1. 各トラックのノート別パン・位相コヒーレンスを計測し、グラフ平滑化で安定した L/C/R 分離候補を作る。
     split_plans: list[
@@ -577,28 +614,30 @@ def split_stereo_pan_tracks_in_stem_midi(
     for instrument_index, instrument in active_instruments:
         ordered_notes = sorted(instrument.notes, key=lambda note: (note.start, note.pitch, note.end))
         note_count = len(ordered_notes)
+        starts = np.asarray([float(note.start) for note in ordered_notes], dtype=np.float64)
+        ends = np.asarray([float(note.end) for note in ordered_notes], dtype=np.float64)
+        pitches = np.asarray([int(note.pitch) for note in ordered_notes], dtype=np.int32)
+
+        start_frames = np.clip(np.floor(starts * frames_per_second).astype(np.int64), 0, num_frames - 1)
+        end_frames = np.minimum(num_frames, np.maximum(start_frames + 1, np.ceil(ends * frames_per_second).astype(np.int64)))
+        frame_lengths = (end_frames - start_frames).astype(np.float64)
+        pitch_rows = np.clip(pitches, pitch_min, pitch_max) - pitch_min
+
+        left_energies = (left_prefix[pitch_rows, end_frames] - left_prefix[pitch_rows, start_frames]) / frame_lengths
+        right_energies = (right_prefix[pitch_rows, end_frames] - right_prefix[pitch_rows, start_frames]) / frame_lengths
+        cross_energies = (cross_prefix[pitch_rows, end_frames] - cross_prefix[pitch_rows, start_frames]) / frame_lengths
+
         raw_pans = np.empty(note_count, dtype=np.float64)
-        raw_coherences = np.empty(note_count, dtype=np.float64)
-        for position, note in enumerate(ordered_notes):
-            start_frame = max(0, min(num_frames - 1, int(math.floor(float(note.start) * frames_per_second))))
-            end_frame = min(num_frames, max(start_frame + 1, int(math.ceil(float(note.end) * frames_per_second))))
-            clamped_pitch = max(pitch_min, min(pitch_max, int(note.pitch)))
-            pitch_row = clamped_pitch - pitch_min
-            left_energy = float(np.mean(left_pitch[pitch_row, start_frame:end_frame]))
-            right_energy = float(np.mean(right_pitch[pitch_row, start_frame:end_frame]))
-            cross_energy = float(np.mean(cross_pitch[pitch_row, start_frame:end_frame]))
+        for position in range(note_count):
             raw_pans[position] = float(
                 _energy_pair_to_pan_cc10(
-                    left_energy,
-                    right_energy,
+                    float(left_energies[position]),
+                    float(right_energies[position]),
                     min_pan=0,
                     max_pan=127,
                 )
             )
-            raw_coherences[position] = float((2.0 * cross_energy) / max(left_energy + right_energy, 1e-12))
-
-        starts = np.asarray([float(note.start) for note in ordered_notes], dtype=np.float64)
-        pitches = np.asarray([int(note.pitch) for note in ordered_notes], dtype=np.int32)
+        raw_coherences = (2.0 * cross_energies) / np.maximum(left_energies + right_energies, 1e-12)
 
         # ノート単位の単項スコア: L/R は振幅パン、C は中央パンかつ高位相コヒーレンスを必須条件にする。
         unary_scores = np.zeros((note_count, 3), dtype=np.float64)

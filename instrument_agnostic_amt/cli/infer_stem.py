@@ -67,6 +67,10 @@ from instrument_agnostic_amt.runtime import (
     resolve_amp_dtype,
     resolve_device,
 )
+from instrument_agnostic_amt.soundfont import (
+    RENDER_COMPARE_SPEED_PRESETS,
+    resolve_soundfont_path,
+)
 from instrument_agnostic_amt.taxonomy.instrument_classes import INSTRUMENT_CLASSES
 
 # セッション中にモデルを使い回して、再実行時の待ち時間を減らす。
@@ -697,7 +701,11 @@ def run_stem_separated_transcription(
     max_midi_melodic_instruments: int = 15,
     transcribe_drum_stems: bool = True,
     cleanup_separated_stems: bool = False,
+    soundfont_path: Path | str | None = None,
+    fluidsynth_executable: Path | str | None = None,
+    render_compare_speed: str = "balanced",
     refine_instruments: bool = False,
+    refine_with_render_compare: bool = False,
     refinement_checkpoint_path: Path | str | None = None,
     refinement_mode: str = "cluster",
     refinement_stem_names: Sequence[str] | None = None,
@@ -705,6 +713,7 @@ def run_stem_separated_transcription(
     refinement_fluidsynth_executable: Path | str | None = None,
     refinement_render_compare_config: RenderCompareConfig | None = None,
     predict_velocity: bool = True,
+    velocity_with_render_compare: bool = False,
     velocity_checkpoint_path: Path | str | None = None,
     velocity_soundfont_path: Path | str | None = None,
     velocity_fluidsynth_executable: Path | str | None = None,
@@ -728,29 +737,72 @@ def run_stem_separated_transcription(
     compile_mode: str = "default",
     semi_crf_backend: str = "torch",
 ) -> dict[str, object]:
-    """ステム分離 -> 各ステム採譜 -> 楽器再ラベリング -> MIDI マージ -> Velocity予測 -> Beat/Chord予測を一括実行する。
+    """ステム分離 -> 各ステム採譜 -> 楽器再ラベリング -> 過剰分割結合 -> ビート量子化 -> MIDI マージ -> Velocity/Pan最適化 -> Beat/Chord予測を一括実行する。
 
-    low_vram_mode=True にすると、モデルをすべて CPU メモリに常駐させ、
-    各ステムの採譜を行う直前に対象モデルだけを GPU へ移動し、終わったら
-    すぐ CPU へ戻す。GPU に置かれるモデルは常に 1 つだけになる。
-
-    amp は AMT・楽器再ラベリング・Velocity の 3 段の backbone に共通で効く。
-    どの段も窓ごとの backbone が支配項で、AMP の有無で 2〜3 割変わる。
-    Beat/Chord だけは FP32 のままにしている。こちらは推論時間の大半が
-    Python 側のビート格子 DP で、backbone を速くしても全体はほとんど動かない
-    一方、確率がそのまま離散的なメーター判定に入るため。
-
-    beat_source はビート・ダウンビート・拍子の推定元 (BEAT_SOURCES)。
-    既定の "sheetsage2" では元音源から SheetSage2-Refined のビートトラッカーで
-    推定した拍の格子でテンポマップを作る。
-    コードとキーはどちらの場合も tsumugi の beat/chord モデルの推定を使う。
-    SheetSage2-Refined の推論に失敗したときは警告を出して tsumugi のビートに戻す。
+    Render & Compare（実音源フィードバック）系のいずれかが有効で `soundfont_path` が未指定のときは、
+    既定の `MuseScore_General.sf2`（MIT License）を自動的にキャッシュへダウンロードして使用する。
+    `render_compare_speed`（`"fast"` / `"balanced"` / `"quality"`）で速度と精度のバランスを一括指定できる。
     """
     audio_file = Path(audio_path)
     if not audio_file.exists():
         raise FileNotFoundError(f"Audio file not found: {audio_file}")
     if beat_source not in BEAT_SOURCES:
         raise ValueError(f"beat_source must be one of {BEAT_SOURCES}, got {beat_source!r}")
+    normalized_render_compare_speed = str(render_compare_speed).strip().lower()
+    if normalized_render_compare_speed not in RENDER_COMPARE_SPEED_PRESETS:
+        raise ValueError(
+            f"render_compare_speed must be one of {RENDER_COMPARE_SPEED_PRESETS}, got {render_compare_speed!r}"
+        )
+
+    # Render & Compare のいずれかが有効なら共通 SoundFont を一度だけ解決（未指定時は自動ダウンロード）。
+    needs_refinement_rc = bool(
+        refine_instruments
+        and (
+            refine_with_render_compare
+            or refinement_soundfont_path is not None
+            or refinement_render_compare_config is not None
+        )
+    )
+    needs_defragment_rc = bool(defragment_with_render_compare)
+    needs_quantize_rc = bool(quantize_with_render_compare)
+    needs_velocity_rc = bool(
+        predict_velocity
+        and (
+            velocity_with_render_compare
+            or velocity_soundfont_path is not None
+            or velocity_render_compare_config is not None
+        )
+    )
+    any_render_compare_requested = (
+        needs_refinement_rc or needs_defragment_rc or needs_quantize_rc or needs_velocity_rc
+    )
+
+    shared_soundfont_path: Path | None = None
+    explicit_shared_soundfont = (
+        soundfont_path
+        or quantize_soundfont_path
+        or velocity_soundfont_path
+        or refinement_soundfont_path
+    )
+    if any_render_compare_requested:
+        # すべての有効ステップにカスタム config が明示されている場合を除き、共通 SF2 を解決・自動ダウンロードする。
+        needs_shared_soundfont = (
+            (needs_refinement_rc and refinement_render_compare_config is None and refinement_soundfont_path is None)
+            or (needs_defragment_rc and defragment_render_compare_config is None)
+            or (needs_quantize_rc and quantize_render_compare_config is None and quantize_soundfont_path is None)
+            or (needs_velocity_rc and velocity_render_compare_config is None and velocity_soundfont_path is None)
+        )
+        if needs_shared_soundfont:
+            shared_soundfont_path = resolve_soundfont_path(explicit_shared_soundfont)
+        elif explicit_shared_soundfont is not None:
+            shared_soundfont_path = resolve_soundfont_path(explicit_shared_soundfont, auto_download=False)
+
+    shared_fluidsynth_executable = (
+        fluidsynth_executable
+        or quantize_fluidsynth_executable
+        or velocity_fluidsynth_executable
+        or refinement_fluidsynth_executable
+    )
 
     bundle = get_stem_pipeline_models(
         checkpoint_path=checkpoint_path,
@@ -934,6 +986,20 @@ def run_stem_separated_transcription(
 
     # 4.5 Instrument Refinement でステム内の楽器ラベルを付け直す。
     instruments_refined = False
+    effective_refinement_rc_config = refinement_render_compare_config
+    if effective_refinement_rc_config is None and needs_refinement_rc:
+        refinement_sf2 = (
+            resolve_soundfont_path(refinement_soundfont_path, auto_download=False)
+            if refinement_soundfont_path is not None
+            else shared_soundfont_path
+        )
+        if refinement_sf2 is not None:
+            effective_refinement_rc_config = RenderCompareConfig.for_speed_preset(
+                refinement_sf2,
+                speed=normalized_render_compare_speed,
+                fluidsynth_executable=refinement_fluidsynth_executable or shared_fluidsynth_executable,
+            )
+
     if refine_instruments:
         try:
             print("Refining stem instrument labels...")
@@ -957,9 +1023,9 @@ def run_stem_separated_transcription(
                 waveform_loader=load_run_waveform,
                 amp=amt_amp_enabled,
                 amp_dtype=amt_amp_dtype,
-                soundfont_path=refinement_soundfont_path,
-                fluidsynth_executable=refinement_fluidsynth_executable,
-                render_compare_config=refinement_render_compare_config,
+                soundfont_path=refinement_soundfont_path if effective_refinement_rc_config is None else None,
+                fluidsynth_executable=refinement_fluidsynth_executable or shared_fluidsynth_executable,
+                render_compare_config=effective_refinement_rc_config,
             )
             if refined_midi_paths:
                 stem_midi_paths.update(refined_midi_paths)
@@ -973,23 +1039,51 @@ def run_stem_separated_transcription(
             if not predict_velocity and waveform_cache is not None:
                 waveform_cache.clear()
 
-    # 4.7 (任意) Phase 1-E: Render & Compare 過剰分割ノート結合（持続系オーケストラ楽器の細切れ防止）。
+    # Render & Compare 3 段（defragment / quantize / velocity）で共通利用するリサンプリング済み波形キャッシュ。
+    # 同一 sample_rate（例: balanced の 16 kHz）で元ステム WAV を何度もディスク読込・CPU リサンプリングする無駄を省く。
+    render_compare_stereo_cache: dict[tuple[str, int], np.ndarray] = {}
+
+    def _get_cached_stereo_audio(audio_key: str, path: Path | str, target_sample_rate: int) -> np.ndarray:
+        cache_key = (str(audio_key).lower(), int(target_sample_rate))
+        cached = render_compare_stereo_cache.get(cache_key)
+        if cached is not None:
+            return cached
+        from instrument_agnostic_amt.velocity.render_compare_velocity import _load_stereo_audio
+
+        loaded = _load_stereo_audio(Path(path), target_sample_rate=int(target_sample_rate))
+        render_compare_stereo_cache[cache_key] = loaded
+        return loaded
+
+    def _preloaded_mono_stems(target_sample_rate: int) -> dict[str, np.ndarray]:
+        return {
+            str(stem_name).lower(): _get_cached_stereo_audio(stem_name, stem_path, target_sample_rate)
+            .mean(axis=0)
+            .astype(np.float32, copy=False)
+            for stem_name, stem_path in stems.items()
+            if Path(stem_path).is_file()
+        }
+
+    def _preloaded_stereo_stems(target_sample_rate: int) -> dict[str, np.ndarray]:
+        return {
+            str(stem_name).lower(): _get_cached_stereo_audio(stem_name, stem_path, target_sample_rate)
+            for stem_name, stem_path in stems.items()
+            if Path(stem_path).is_file()
+        }
+
+    # 4.7 (任意) Render & Compare 過剰分割ノート結合（持続系オーケストラ楽器の細切れ防止）。
     defragmented_with_render_compare = False
     defragmented_stem_midi_dir = run_root / "defragmented_stem_midis"
-    resolved_quantize_soundfont = quantize_soundfont_path or velocity_soundfont_path or refinement_soundfont_path
-    resolved_quantize_fluidsynth = (
-        quantize_fluidsynth_executable or velocity_fluidsynth_executable or refinement_fluidsynth_executable
-    )
+    resolved_quantize_soundfont = quantize_soundfont_path or shared_soundfont_path
+    resolved_quantize_fluidsynth = quantize_fluidsynth_executable or shared_fluidsynth_executable
     effective_defrag_config = defragment_render_compare_config
-    if effective_defrag_config is None and defragment_with_render_compare and resolved_quantize_soundfont is not None:
-        effective_defrag_config = RenderCompareDefragmentConfig(
-            soundfont_path=Path(resolved_quantize_soundfont),
-            fluidsynth_executable=(
-                Path(resolved_quantize_fluidsynth) if resolved_quantize_fluidsynth is not None else None
-            ),
+    if effective_defrag_config is None and needs_defragment_rc and resolved_quantize_soundfont is not None:
+        effective_defrag_config = RenderCompareDefragmentConfig.for_speed_preset(
+            resolved_quantize_soundfont,
+            speed=normalized_render_compare_speed,
+            fluidsynth_executable=resolved_quantize_fluidsynth,
             max_melodic_instruments=int(max_midi_melodic_instruments),
         )
-    if defragment_with_render_compare and effective_defrag_config is not None:
+    if needs_defragment_rc and effective_defrag_config is not None:
         try:
             print("De-fragmenting sustained-instrument stem MIDIs via Render & Compare...")
             defrag_report = defragment_stems_by_render_compare(
@@ -997,6 +1091,7 @@ def run_stem_separated_transcription(
                 stem_audios=stems,
                 config=effective_defrag_config,
                 output_stem_dir=defragmented_stem_midi_dir,
+                preloaded_waveforms=_preloaded_mono_stems(int(effective_defrag_config.sample_rate)),
             )
             if defrag_report.get("output_stem_paths"):
                 stem_midi_paths.update(
@@ -1011,49 +1106,94 @@ def run_stem_separated_transcription(
             print(f"Warning: Render & Compare note de-fragmentation skipped due to error: {err}")
 
     # 4.8 (任意) Render & Compare 型ビート量子化:
-    #     SheetSage2-Refined でビート格子を先に取得し、オンセットズレを各ステム単位で補正する。
+    #     SheetSage2-Refined（または tsumugi）でビート格子を先に取得し、オンセットズレを各ステム単位で補正する。
     #     位相アラインメント済みのビート格子は後段の Step 6.5 (Beat/Chord テンポマップ書き出し) でも再利用する。
     precomputed_sheetsage_beat_grid: SheetSageBeatGrid | None = None
     quantized_with_render_compare = False
     quantized_stem_midi_dir = run_root / "quantized_stem_midis"
     effective_quantize_config = quantize_render_compare_config
-    if effective_quantize_config is None and quantize_with_render_compare and resolved_quantize_soundfont is not None:
-        effective_quantize_config = RenderCompareQuantizeConfig(
-            soundfont_path=Path(resolved_quantize_soundfont),
-            fluidsynth_executable=(
-                Path(resolved_quantize_fluidsynth) if resolved_quantize_fluidsynth is not None else None
-            ),
+    if effective_quantize_config is None and needs_quantize_rc and resolved_quantize_soundfont is not None:
+        effective_quantize_config = RenderCompareQuantizeConfig.for_speed_preset(
+            resolved_quantize_soundfont,
+            speed=normalized_render_compare_speed,
+            fluidsynth_executable=resolved_quantize_fluidsynth,
             max_melodic_instruments=int(max_midi_melodic_instruments),
             write_tempo_map=False,
         )
 
-    if quantize_with_render_compare and effective_quantize_config is not None:
+    if needs_quantize_rc and effective_quantize_config is not None:
         sheetsage_model = None
+        beat_grid_input: BeatGridInput | None = None
         try:
-            print("Predicting beats with SheetSage2-Refined for Render & Compare quantization...")
-            if low_vram_mode:
-                sheetsage_model = get_sheetsage_model(device_preference="cpu")
-                _move_sheetsage_model(sheetsage_model, device)
-            else:
-                sheetsage_model = get_sheetsage_model(device_preference=device)
-            source_waveform, source_sample_rate = _load_audio_channels_first(audio_file)
-            precomputed_sheetsage_beat_grid, sheetsage_beats = predict_sheetsage_beat_grid(
-                sheetsage_model,
-                source_waveform.mean(axis=0),
-                source_sample_rate,
-            )
-            del source_waveform
-            sheetsage_json_path = merged_dir / f"{audio_file.stem}_sheetsage2.beats.json"
-            sheetsage_json_path.write_text(
-                json.dumps({"audio": str(audio_file)} | sheetsage_beats, ensure_ascii=False),
-                encoding="utf-8",
-            )
-            beat_grid_input = BeatGridInput(
-                beat_times=precomputed_sheetsage_beat_grid.beat_times,
-                downbeat_times=precomputed_sheetsage_beat_grid.downbeat_times,
-                meter_segments=precomputed_sheetsage_beat_grid.meter_segments,
-            )
+            if beat_source == "sheetsage2":
+                try:
+                    print("Predicting beats with SheetSage2-Refined for Render & Compare quantization...")
+                    if low_vram_mode:
+                        sheetsage_model = get_sheetsage_model(device_preference="cpu")
+                        _move_sheetsage_model(sheetsage_model, device)
+                    else:
+                        sheetsage_model = get_sheetsage_model(device_preference=device)
+                    source_waveform, source_sample_rate = _load_audio_channels_first(audio_file)
+                    precomputed_sheetsage_beat_grid, sheetsage_beats = predict_sheetsage_beat_grid(
+                        sheetsage_model,
+                        source_waveform.mean(axis=0),
+                        source_sample_rate,
+                    )
+                    del source_waveform
+                    sheetsage_json_path = merged_dir / f"{audio_file.stem}_sheetsage2.beats.json"
+                    sheetsage_json_path.write_text(
+                        json.dumps({"audio": str(audio_file)} | sheetsage_beats, ensure_ascii=False),
+                        encoding="utf-8",
+                    )
+                    beat_grid_input = BeatGridInput(
+                        beat_times=precomputed_sheetsage_beat_grid.beat_times,
+                        downbeat_times=precomputed_sheetsage_beat_grid.downbeat_times,
+                        meter_segments=precomputed_sheetsage_beat_grid.meter_segments,
+                    )
+                except Exception as sheetsage_err:
+                    print(
+                        "Warning: SheetSage2-Refined beat tracking failed for quantization; "
+                        f"falling back to tsumugi beat model: {sheetsage_err}"
+                    )
+                    precomputed_sheetsage_beat_grid = None
+                    beat_grid_input = None
+
+            if beat_grid_input is None:
+                # beat_source="tsumugi" または SheetSage2 失敗時は tsumugi beat/chord モデルからビート格子を取得する。
+                from instrument_agnostic_amt.quantization.render_compare_quantize import load_beat_grid_from_midi
+
+                temp_merged_for_beats = merged_dir / f"{audio_file.stem}_pre_quantize_tmp.mid"
+                temp_beat_midi = merged_dir / f"{audio_file.stem}_tsumugi_beats_tmp.mid"
+                merge_midis_logic(
+                    [stem_midi_paths[name] for name in sorted(stem_midi_paths)],
+                    temp_merged_for_beats,
+                    max_melodic_instruments=max_midi_melodic_instruments,
+                )
+                bc_model, bc_config, bc_metadata = get_beat_chord_models(
+                    checkpoint_path=beat_chord_checkpoint_path,
+                    device_preference=device,
+                )
+                predict_beat_chord_for_midi(
+                    input_midi_path=temp_merged_for_beats,
+                    output_midi_path=temp_beat_midi,
+                    checkpoint_path=beat_chord_checkpoint_path,
+                    device=device,
+                    window_batch_size=window_batch_size,
+                    preloaded_model=bc_model,
+                    preloaded_model_config=bc_config,
+                    preloaded_metadata=bc_metadata,
+                    audio_path=audio_file if beat_chord_use_audio else None,
+                    beat_grid=None,
+                )
+                beat_grid_input = load_beat_grid_from_midi(temp_beat_midi)
+                temp_merged_for_beats.unlink(missing_ok=True)
+                temp_beat_midi.unlink(missing_ok=True)
+
             print("Quantizing stem MIDI timings via Render & Compare...")
+            quantize_sample_rate = int(effective_quantize_config.sample_rate)
+            quantize_full_mix_mono = _get_cached_stereo_audio("__full_mix__", audio_file, quantize_sample_rate).mean(axis=0).astype(
+                np.float32, copy=False
+            )
             quantize_report = quantize_stems_by_render_compare(
                 stem_midis=stem_midi_paths,
                 stem_audios=stems,
@@ -1061,6 +1201,8 @@ def run_stem_separated_transcription(
                 config=effective_quantize_config,
                 original_mix_audio=audio_file,
                 output_stem_dir=quantized_stem_midi_dir,
+                preloaded_waveforms=_preloaded_mono_stems(quantize_sample_rate),
+                preloaded_full_mix=quantize_full_mix_mono,
             )
             if quantize_report.get("output_stem_paths"):
                 stem_midi_paths.update(
@@ -1068,7 +1210,7 @@ def run_stem_separated_transcription(
                 )
                 quantized_with_render_compare = True
                 phase_shift_seconds = float(quantize_report.get("beat_phase_shift_ms", 0.0)) / 1000.0
-                if abs(phase_shift_seconds) > 1e-6:
+                if precomputed_sheetsage_beat_grid is not None and abs(phase_shift_seconds) > 1e-6:
                     shifted_grid = beat_grid_input.shifted(phase_shift_seconds)
                     precomputed_sheetsage_beat_grid = SheetSageBeatGrid(
                         beat_times=shifted_grid.beat_times,
@@ -1095,45 +1237,61 @@ def run_stem_separated_transcription(
         max_melodic_instruments=max_midi_melodic_instruments,
     )
 
-    # 6. Velocity予測（または SoundFont 指定時は Render & Compare 閉ループ最適化）を実行する。
+    # 6. Velocity予測（または Render & Compare 閉ループ最適化）を実行する。
     preloaded_velocity_waveforms: dict[str, torch.Tensor] | None = None
+    velocity_optimized_with_render_compare = False
     effective_velocity_rc_config = velocity_render_compare_config
-    if effective_velocity_rc_config is None and velocity_soundfont_path is not None:
-        effective_velocity_rc_config = RenderCompareVelocityConfig(
-            soundfont_path=Path(velocity_soundfont_path),
-            fluidsynth_executable=(
-                Path(velocity_fluidsynth_executable) if velocity_fluidsynth_executable is not None else None
-            ),
-            max_melodic_instruments=int(max_midi_melodic_instruments),
+    if effective_velocity_rc_config is None and needs_velocity_rc:
+        resolved_velocity_sf2 = (
+            resolve_soundfont_path(velocity_soundfont_path, auto_download=False)
+            if velocity_soundfont_path is not None
+            else shared_soundfont_path
         )
+        if resolved_velocity_sf2 is not None:
+            effective_velocity_rc_config = RenderCompareVelocityConfig.for_speed_preset(
+                resolved_velocity_sf2,
+                speed=normalized_render_compare_speed,
+                fluidsynth_executable=velocity_fluidsynth_executable or shared_fluidsynth_executable,
+                max_melodic_instruments=int(max_midi_melodic_instruments),
+            )
 
     if predict_velocity and effective_velocity_rc_config is not None:
         try:
-            print("Optimizing note velocities and track CC#7 via Render & Compare...")
+            print("Optimizing note velocities, CC#7 mix, and stereo pan via Render & Compare...")
             stem_midis_map = {
                 stem_name: midi_path
                 for stem_name, midi_path in stem_midi_paths.items()
                 if Path(midi_path).exists()
             }
             velocity_midi_path = merged_dir / f"{audio_file.stem}_velocity.mid"
+            velocity_sample_rate = int(effective_velocity_rc_config.sample_rate)
+            velocity_full_mix_mono = (
+                _get_cached_stereo_audio("__full_mix__", audio_file, velocity_sample_rate)
+                .mean(axis=0)
+                .astype(np.float32, copy=False)
+            )
             rc_report = optimize_velocity_and_mix_by_render_compare(
                 stem_midis=stem_midis_map,
                 stem_audios=stems,
                 config=effective_velocity_rc_config,
                 original_mix_audio=audio_file,
                 output_midi_path=velocity_midi_path,
+                preloaded_stereo_waveforms=_preloaded_stereo_stems(velocity_sample_rate),
+                preloaded_full_mix_mono=velocity_full_mix_mono,
             )
             merged_midi_path = velocity_midi_path
+            velocity_optimized_with_render_compare = True
             if rc_report["iterations"]:
                 first_mae = rc_report["iterations"][0]["overall_mae_db"]
                 last_mae = rc_report["iterations"][-1]["overall_mae_db"]
                 print(
-                    f"Updated merged MIDI with Render & Compare velocity/CC#7 "
+                    f"Updated merged MIDI with Render & Compare velocity/CC#7/pan "
                     f"(MAE: {first_mae:.2f} dB -> {last_mae:.2f} dB): {merged_midi_path}"
                 )
         except Exception as err:
             print(f"Warning: Render & Compare velocity optimization skipped due to error: {err}")
         finally:
+            render_compare_stereo_cache.clear()
             if waveform_cache is not None:
                 waveform_cache.clear()
     elif predict_velocity:
@@ -1200,6 +1358,7 @@ def run_stem_separated_transcription(
                 _move_model(velocity_model, "cpu")
             if preloaded_velocity_waveforms is not None:
                 preloaded_velocity_waveforms.clear()
+            render_compare_stereo_cache.clear()
             if waveform_cache is not None:
                 waveform_cache.clear()
 
@@ -1311,11 +1470,18 @@ def run_stem_separated_transcription(
     }
     if instruments_refined:
         result["refined_stem_midi_dir"] = str(refined_stem_midi_dir)
+        result["refined_with_render_compare"] = effective_refinement_rc_config is not None
     if defragmented_with_render_compare:
         result["defragmented_with_render_compare"] = True
         result["defragmented_stem_midi_dir"] = str(defragmented_stem_midi_dir)
     if quantized_with_render_compare:
         result["quantized_with_render_compare"] = True
         result["quantized_stem_midi_dir"] = str(quantized_stem_midi_dir)
+    if velocity_optimized_with_render_compare:
+        result["velocity_optimized_with_render_compare"] = True
+    if any_render_compare_requested:
+        result["render_compare_speed"] = normalized_render_compare_speed
+        if shared_soundfont_path is not None:
+            result["soundfont_path"] = str(shared_soundfont_path)
     print("Final Merged MIDI:", merged_midi_path)
     return result

@@ -33,12 +33,18 @@ import pretty_midi
 import soundfile as sf
 import torch
 
+from ..soundfont import (
+    FluidSynthRenderOptions,
+    RENDER_COMPARE_SPEED_PRESETS,
+    default_parallel_render_workers,
+    render_midi_batch_to_stereo_arrays,
+    render_midi_to_stereo_array,
+    resolve_signal_processing_device,
+)
 from ..velocity.expression_pan import is_sustained_gm_program
 from ..velocity.render_compare_velocity import _merge_optimized_stem_midis
 from .render_compare_quantize import (
-    RenderCompareQuantizeConfig,
     _load_mono_audio,
-    _render_packed_midi_with_fluidsynth,
     _write_packed_variants_midi,
 )
 
@@ -88,6 +94,32 @@ class RenderCompareDefragmentConfig:
     tiny_fragment_max_gap_seconds: float = 0.025
     flux_distance_weight: float = 1.6
     max_melodic_instruments: int = 15
+    render_active_windows_only: bool = True
+    active_window_margin_seconds: float = 0.65
+    parallel_render_workers: int | None = None
+
+    @classmethod
+    def for_speed_preset(
+        cls,
+        soundfont_path: Path | str,
+        *,
+        speed: str = "balanced",
+        fluidsynth_executable: Path | str | None = None,
+        max_melodic_instruments: int = 15,
+        parallel_render_workers: int | None = None,
+    ) -> "RenderCompareDefragmentConfig":
+        """速度プリセット (`fast` / `balanced` / `quality`) から過剰分割結合設定を構築する。"""
+        normalized_speed = str(speed).strip().lower()
+        if normalized_speed not in RENDER_COMPARE_SPEED_PRESETS:
+            raise ValueError(f"speed must be one of {RENDER_COMPARE_SPEED_PRESETS}, got {speed!r}")
+        resolved_executable = Path(fluidsynth_executable) if fluidsynth_executable is not None else None
+        return cls(
+            soundfont_path=Path(soundfont_path),
+            fluidsynth_executable=resolved_executable,
+            max_melodic_instruments=int(max_melodic_instruments),
+            render_active_windows_only=(normalized_speed != "quality"),
+            parallel_render_workers=parallel_render_workers,
+        )
 
     def __post_init__(self) -> None:
         if self.sample_rate <= 0:
@@ -164,20 +196,24 @@ def _compute_pitch_envelope_db(
     """
     if waveform.size < n_fft:
         waveform = np.pad(waveform, (0, n_fft - waveform.size))
-    window = torch.hann_window(n_fft, dtype=torch.float32)
-    window_energy = float(window.square().sum().item())
-    spectrum = torch.stft(
-        torch.from_numpy(waveform.astype(np.float32, copy=False)),
-        n_fft=n_fft,
-        hop_length=hop_length,
-        win_length=n_fft,
-        window=window,
-        center=True,
-        return_complex=True,
-    )
-    power = (spectrum.real.square() + spectrum.imag.square()).numpy() / max(window_energy, 1e-8)
-    pitch_power = pitch_filterbank @ power
-    pitch_db = (10.0 * np.log10(np.maximum(pitch_power, 1e-10))).astype(np.float32, copy=False)
+    signal_device = resolve_signal_processing_device()
+    with torch.inference_mode():
+        wave_tensor = torch.from_numpy(np.ascontiguousarray(waveform, dtype=np.float32)).to(signal_device)
+        window = torch.hann_window(n_fft, dtype=torch.float32, device=signal_device)
+        window_energy = float(window.square().sum().item())
+        spectrum = torch.stft(
+            wave_tensor,
+            n_fft=n_fft,
+            hop_length=hop_length,
+            win_length=n_fft,
+            window=window,
+            center=True,
+            return_complex=True,
+        )
+        power = (spectrum.real.square() + spectrum.imag.square()) / max(window_energy, 1e-8)
+        filterbank_tensor = torch.from_numpy(np.ascontiguousarray(pitch_filterbank, dtype=np.float32)).to(signal_device)
+        pitch_power = filterbank_tensor @ power
+        pitch_db = (10.0 * torch.log10(pitch_power.clamp_min(1e-10))).cpu().numpy()
     frames_per_second = float(sample_rate) / float(hop_length)
     return pitch_db, frames_per_second
 
@@ -228,16 +264,20 @@ def _compute_boundary_envelope_distance_db(
     frames_per_second: float,
     half_window_seconds: float,
     flux_distance_weight: float,
+    rendered_split_time_seconds: float | None = None,
 ) -> float:
     """境界前後 ±half_window_seconds における対象ピッチ包絡線の中心化 dB-L1 ＋再アタックフラックス距離を返す。"""
-    num_frames = min(int(target_pitch_db.size), int(rendered_pitch_db.size))
-    start_frame = max(0, int(math.floor((split_time_seconds - half_window_seconds) * frames_per_second)))
-    end_frame = min(num_frames, int(math.ceil((split_time_seconds + half_window_seconds) * frames_per_second)))
-    if end_frame - start_frame < 4:
+    target_start = max(0, int(math.floor((split_time_seconds - half_window_seconds) * frames_per_second)))
+    target_end = min(int(target_pitch_db.size), int(math.ceil((split_time_seconds + half_window_seconds) * frames_per_second)))
+    rendered_center = float(split_time_seconds if rendered_split_time_seconds is None else rendered_split_time_seconds)
+    rendered_start = max(0, int(math.floor((rendered_center - half_window_seconds) * frames_per_second)))
+    rendered_end = min(int(rendered_pitch_db.size), int(math.ceil((rendered_center + half_window_seconds) * frames_per_second)))
+    common_length = min(target_end - target_start, rendered_end - rendered_start)
+    if common_length < 4:
         return 0.0
 
-    target_slice = target_pitch_db[start_frame:end_frame].astype(np.float64)
-    rendered_slice = rendered_pitch_db[start_frame:end_frame].astype(np.float64)
+    target_slice = target_pitch_db[target_start : target_start + common_length].astype(np.float64)
+    rendered_slice = rendered_pitch_db[rendered_start : rendered_start + common_length].astype(np.float64)
 
     # 音量差を消すため局所窓の平均を引いて、包絡線の「凹み・再上昇の形」だけを比較する。
     target_centered = target_slice - float(target_slice.mean())
@@ -250,6 +290,80 @@ def _compute_boundary_envelope_distance_db(
     flux_l1_db = float(np.mean(np.abs(target_flux - rendered_flux)))
 
     return shape_l1_db + float(flux_distance_weight) * flux_l1_db
+
+
+def _build_active_boundary_windows(
+    candidates: Sequence[_BoundaryCandidate],
+    *,
+    stem_duration_seconds: float,
+    margin_seconds: float,
+    window_gap_seconds: float = 0.25,
+) -> tuple[list[tuple[float, float, float]], float]:
+    """結合候補境界の前後区間だけを結合した短縮タイムライン窓 `(orig_start, orig_end, packed_start)` を返す。"""
+    raw_intervals = sorted(
+        (
+            max(0.0, float(candidate.split_time_seconds) - float(margin_seconds)),
+            min(float(stem_duration_seconds), float(candidate.split_time_seconds) + float(margin_seconds)),
+        )
+        for candidate in candidates
+    )
+    merged: list[list[float]] = []
+    for start_sec, end_sec in raw_intervals:
+        if end_sec <= start_sec + 0.05:
+            continue
+        if merged and start_sec <= merged[-1][1] + 0.60:
+            merged[-1][1] = max(merged[-1][1], end_sec)
+        else:
+            merged.append([start_sec, end_sec])
+
+    packed_windows: list[tuple[float, float, float]] = []
+    cursor = 0.0
+    for start_sec, end_sec in merged:
+        packed_windows.append((start_sec, end_sec, cursor))
+        cursor += (end_sec - start_sec) + float(window_gap_seconds)
+    return packed_windows, max(0.25, cursor)
+
+
+def _crop_instruments_to_packed_windows(
+    instruments: Sequence[pretty_midi.Instrument],
+    packed_windows: Sequence[tuple[float, float, float]],
+) -> list[pretty_midi.Instrument]:
+    """指定された短縮窓群に重なるノートだけを抽出し、短縮タイムラインへ詰めた楽器リストを返す。"""
+    cropped_instruments: list[pretty_midi.Instrument] = []
+    for instrument in instruments:
+        if not instrument.notes:
+            continue
+        cropped = pretty_midi.Instrument(
+            program=int(instrument.program),
+            is_drum=bool(instrument.is_drum),
+            name=str(instrument.name),
+        )
+        cropped.control_changes = [
+            pretty_midi.ControlChange(number=int(cc.number), value=int(cc.value), time=0.0)
+            for cc in instrument.control_changes
+            if int(cc.number) in (7, 10, 11)
+        ]
+        for window_start, window_end, packed_start in packed_windows:
+            window_length = window_end - window_start
+            for note in instrument.notes:
+                if float(note.end) <= window_start or float(note.start) >= window_end:
+                    continue
+                local_start = max(0.0, float(note.start) - window_start)
+                local_end = min(window_length, float(note.end) - window_start)
+                if local_end <= local_start + 0.01:
+                    continue
+                cropped.notes.append(
+                    pretty_midi.Note(
+                        velocity=int(note.velocity),
+                        pitch=int(note.pitch),
+                        start=float(packed_start + local_start),
+                        end=float(packed_start + local_end),
+                    )
+                )
+        if cropped.notes:
+            cropped.notes.sort(key=lambda note: (note.start, note.pitch, note.end))
+            cropped_instruments.append(cropped)
+    return cropped_instruments
 
 
 def _apply_boundary_merges_to_midi(
@@ -309,11 +423,17 @@ def defragment_stems_by_render_compare(
     output_midi_path: Path | str | None = None,
     output_stem_dir: Path | str | None = None,
     packed_midi_renderer: _PackedMidiRenderer | None = None,
+    preloaded_waveforms: Mapping[str, np.ndarray] | None = None,
 ) -> dict[str, Any]:
-    """全ステム MIDI の過剰分割ノートを Render & Compare（2 スロット 1 回起動）で検証・結合する。"""
+    """全ステム MIDI の過剰分割ノートを Render & Compare で検証・結合する。"""
     sample_rate = int(config.sample_rate)
     resolved_midis = {str(name).lower(): Path(path) for name, path in stem_midis.items() if Path(path).is_file()}
     resolved_audios = {str(name).lower(): Path(path) for name, path in stem_audios.items() if Path(path).is_file()}
+    preloaded_normalized = (
+        {str(name).lower(): np.asarray(wave, dtype=np.float32) for name, wave in preloaded_waveforms.items()}
+        if preloaded_waveforms is not None
+        else {}
+    )
     active_stems = sorted(set(resolved_midis) & set(resolved_audios))
     if not active_stems:
         raise ValueError("No matching stem MIDI and audio pairs were found.")
@@ -344,7 +464,11 @@ def defragment_stems_by_render_compare(
         if not midi_object.instruments:
             continue
 
-        mono_audio = _load_mono_audio(resolved_audios[stem_name], target_sample_rate=sample_rate)
+        mono_audio = (
+            preloaded_normalized[stem_name]
+            if stem_name in preloaded_normalized
+            else _load_mono_audio(resolved_audios[stem_name], target_sample_rate=sample_rate)
+        )
         original_midis[stem_name] = midi_object
         target_waveforms[stem_name] = mono_audio
         stem_durations[stem_name] = max(0.25, float(mono_audio.size) / float(sample_rate))
@@ -473,7 +597,8 @@ def defragment_stems_by_render_compare(
         else:
             proposed_merged_midis[stem_name] = copy.deepcopy(original_midis[stem_name])
 
-    # 3. 候補が 1 つでもあるステムだけ 2 スロット (split vs merged) を 1 パック MIDI でレンダリングする。
+    # 3. 候補が 1 つでもあるステムだけ 2 スロット (split vs merged) をレンダリングする。
+    #    本番 FluidSynth 実行時は候補境界の前後区間だけを短縮窓パック＋ステム並列実行して 5〜15 倍高速化する。
     stems_needing_render = [stem_name for stem_name in stems_with_notes if candidates_by_stem[stem_name]]
     final_midis: dict[str, pretty_midi.PrettyMIDI] = {
         stem_name: copy.deepcopy(original_midis[stem_name]) for stem_name in stems_with_notes
@@ -481,47 +606,128 @@ def defragment_stems_by_render_compare(
     stem_reports: dict[str, dict[str, Any]] = {}
     track_reports: list[dict[str, Any]] = []
 
-    rendered_mono = np.zeros(0, dtype=np.float32)
-    slots_by_key: dict[str, Any] = {}
+    rendered_segments_by_key: dict[str, np.ndarray] = {}
+    packed_windows_by_stem: dict[str, list[tuple[float, float, float]] | None] = {}
+
     if stems_needing_render:
-        slot_specs = []
+        render_slots_by_stem: dict[str, list[tuple[str, str, str, Sequence[pretty_midi.Instrument], float]]] = {}
+        expected_samples_by_stem: dict[str, int] = {}
+
         for stem_name in stems_needing_render:
             duration_seconds = stem_durations[stem_name]
-            slot_specs.append((f"{stem_name}::split", stem_name, "split", original_midis[stem_name].instruments, duration_seconds))
-            slot_specs.append((f"{stem_name}::merged", stem_name, "merged", proposed_merged_midis[stem_name].instruments, duration_seconds))
+            use_active_windows = bool(config.render_active_windows_only and packed_midi_renderer is None)
+            if use_active_windows:
+                packed_windows, packed_duration = _build_active_boundary_windows(
+                    candidates_by_stem[stem_name],
+                    stem_duration_seconds=duration_seconds,
+                    margin_seconds=float(config.active_window_margin_seconds),
+                )
+                if packed_windows and packed_duration < duration_seconds * 0.75:
+                    packed_windows_by_stem[stem_name] = packed_windows
+                    split_instruments = _crop_instruments_to_packed_windows(
+                        original_midis[stem_name].instruments,
+                        packed_windows,
+                    )
+                    merged_instruments = _crop_instruments_to_packed_windows(
+                        proposed_merged_midis[stem_name].instruments,
+                        packed_windows,
+                    )
+                    render_duration = packed_duration
+                    expected_samples_by_stem[stem_name] = max(1, int(round(packed_duration * sample_rate)))
+                else:
+                    packed_windows_by_stem[stem_name] = None
+                    split_instruments = original_midis[stem_name].instruments
+                    merged_instruments = proposed_merged_midis[stem_name].instruments
+                    render_duration = duration_seconds
+                    expected_samples_by_stem[stem_name] = int(target_waveforms[stem_name].size)
+            else:
+                packed_windows_by_stem[stem_name] = None
+                split_instruments = original_midis[stem_name].instruments
+                merged_instruments = proposed_merged_midis[stem_name].instruments
+                render_duration = duration_seconds
+                expected_samples_by_stem[stem_name] = int(target_waveforms[stem_name].size)
 
-        render_config = RenderCompareQuantizeConfig(
-            soundfont_path=config.soundfont_path,
-            fluidsynth_executable=config.fluidsynth_executable,
-            sample_rate=sample_rate,
-            slot_gap_seconds=float(config.slot_gap_seconds),
-            render_gain=float(config.render_gain),
-            disable_reverb=bool(config.disable_reverb),
-            disable_chorus=bool(config.disable_chorus),
-        )
+            render_slots_by_stem[stem_name] = [
+                (f"{stem_name}::split", stem_name, "split", split_instruments, render_duration),
+                (f"{stem_name}::merged", stem_name, "merged", merged_instruments, render_duration),
+            ]
+
         with tempfile.TemporaryDirectory(prefix="tsumugi_rc_defragment_") as temp_directory:
             temp_root = Path(temp_directory)
-            packed_midi_path = temp_root / "defragment_packed.mid"
-            packed_wav_path = temp_root / "defragment_packed.wav"
-            slots = _write_packed_variants_midi(
-                slot_specs,
-                output_midi_path=packed_midi_path,
-                slot_gap_seconds=float(config.slot_gap_seconds),
-            )
-            if packed_midi_renderer is not None:
-                packed_midi_renderer(packed_midi_path, packed_wav_path, sample_rate)
-            else:
-                _render_packed_midi_with_fluidsynth(
-                    packed_midi_path,
-                    packed_wav_path,
-                    sample_rate,
-                    config=render_config,
+            parallel_workers = (
+                default_parallel_render_workers(
+                    Path(config.soundfont_path),
+                    len(stems_needing_render),
+                    max_workers=config.parallel_render_workers,
                 )
-            rendered_audio, rendered_rate = sf.read(str(packed_wav_path), dtype="float32", always_2d=True)
-            if int(rendered_rate) != sample_rate:
-                raise ValueError(f"Rendered sample rate mismatch: expected {sample_rate}, got {rendered_rate}")
-            rendered_mono = rendered_audio.mean(axis=1).astype(np.float32, copy=False)
-            slots_by_key = {slot.slot_key: slot for slot in slots}
+                if packed_midi_renderer is None
+                else 1
+            )
+
+            render_options = FluidSynthRenderOptions(
+                soundfont_path=Path(config.soundfont_path),
+                sample_rate=sample_rate,
+                fluidsynth_executable=config.fluidsynth_executable,
+                render_gain=float(config.render_gain),
+                disable_reverb=bool(config.disable_reverb),
+                disable_chorus=bool(config.disable_chorus),
+                polyphony=64,
+            )
+
+            if parallel_workers <= 1 or len(stems_needing_render) == 1:
+                all_slot_specs = [
+                    spec for stem_name in stems_needing_render for spec in render_slots_by_stem[stem_name]
+                ]
+                packed_midi_path = temp_root / "defragment_packed.mid"
+                slots = _write_packed_variants_midi(
+                    all_slot_specs,
+                    output_midi_path=packed_midi_path,
+                    slot_gap_seconds=float(config.slot_gap_seconds),
+                )
+                if packed_midi_renderer is not None:
+                    packed_wav_path = temp_root / "defragment_packed.wav"
+                    packed_midi_renderer(packed_midi_path, packed_wav_path, sample_rate)
+                    rendered_audio, rendered_rate = sf.read(str(packed_wav_path), dtype="float32", always_2d=True)
+                    if int(rendered_rate) != sample_rate:
+                        raise ValueError(f"Rendered sample rate mismatch: expected {sample_rate}, got {rendered_rate}")
+                    rendered_mono = rendered_audio.mean(axis=1).astype(np.float32, copy=False)
+                else:
+                    rendered_stereo = render_midi_to_stereo_array(packed_midi_path, options=render_options)
+                    rendered_mono = rendered_stereo.mean(axis=0).astype(np.float32, copy=False)
+                for slot in slots:
+                    expected_samples = expected_samples_by_stem[slot.stem_name]
+                    start_sample = max(0, int(round(slot.slot_start_seconds * sample_rate)))
+                    segment = rendered_mono[start_sample : min(rendered_mono.size, start_sample + expected_samples)]
+                    if segment.size < expected_samples:
+                        segment = np.pad(segment, (0, expected_samples - segment.size))
+                    rendered_segments_by_key[slot.slot_key] = segment
+            else:
+                stem_midi_paths: list[Path] = []
+                stem_slot_bundles: list[tuple[str, list[Any]]] = []
+                for stem_index, stem_name in enumerate(stems_needing_render):
+                    stem_midi_path = temp_root / f"defrag_{stem_index}.mid"
+                    stem_slots = _write_packed_variants_midi(
+                        render_slots_by_stem[stem_name],
+                        output_midi_path=stem_midi_path,
+                        slot_gap_seconds=float(config.slot_gap_seconds),
+                    )
+                    stem_midi_paths.append(stem_midi_path)
+                    stem_slot_bundles.append((stem_name, stem_slots))
+
+                rendered_stereo_list = render_midi_batch_to_stereo_arrays(
+                    stem_midi_paths,
+                    options=render_options,
+                    max_workers=parallel_workers,
+                )
+                for (stem_name, stem_slots), rendered_stereo in zip(stem_slot_bundles, rendered_stereo_list):
+                    rendered_mono = rendered_stereo.mean(axis=0).astype(np.float32, copy=False)
+                    expected_samples = expected_samples_by_stem[stem_name]
+                    for slot in stem_slots:
+                        start_sample = max(0, int(round(slot.slot_start_seconds * sample_rate)))
+                        segment = rendered_mono[start_sample : min(rendered_mono.size, start_sample + expected_samples)]
+                        if segment.size < expected_samples:
+                            segment = np.pad(segment, (0, expected_samples - segment.size))
+                        rendered_segments_by_key[slot.slot_key] = segment
 
     # 4. 境界ごとに split vs merged の対象ピッチ局所包絡線距離を比較し、改善する境界だけを確定結合する。
     for stem_name in stems_with_notes:
@@ -538,23 +744,25 @@ def defragment_stems_by_render_compare(
             continue
 
         target_pitch_db, frames_per_second = target_pitch_db_by_stem[stem_name]
-        expected_samples = int(target_waveforms[stem_name].size)
+        split_pitch_db, _ = _compute_pitch_envelope_db(
+            rendered_segments_by_key[f"{stem_name}::split"],
+            sample_rate=sample_rate,
+            pitch_filterbank=pitch_filterbank,
+        )
+        merged_pitch_db, _ = _compute_pitch_envelope_db(
+            rendered_segments_by_key[f"{stem_name}::merged"],
+            sample_rate=sample_rate,
+            pitch_filterbank=pitch_filterbank,
+        )
+        stem_packed_windows = packed_windows_by_stem.get(stem_name)
 
-        def _extract_slot_pitch_db(slot_key: str) -> np.ndarray:
-            slot = slots_by_key[slot_key]
-            start_sample = max(0, int(round(slot.slot_start_seconds * sample_rate)))
-            segment = rendered_mono[start_sample : min(rendered_mono.size, start_sample + expected_samples)]
-            if segment.size < expected_samples:
-                segment = np.pad(segment, (0, expected_samples - segment.size))
-            pitch_db, _ = _compute_pitch_envelope_db(
-                segment,
-                sample_rate=sample_rate,
-                pitch_filterbank=pitch_filterbank,
-            )
-            return pitch_db
-
-        split_pitch_db = _extract_slot_pitch_db(f"{stem_name}::split")
-        merged_pitch_db = _extract_slot_pitch_db(f"{stem_name}::merged")
+        def _map_to_rendered_time(original_time_seconds: float) -> float:
+            if not stem_packed_windows:
+                return original_time_seconds
+            for window_start, window_end, packed_start in stem_packed_windows:
+                if window_start - 1e-4 <= original_time_seconds <= window_end + 1e-4:
+                    return packed_start + (original_time_seconds - window_start)
+            return original_time_seconds
 
         accepted_by_track_pitch: dict[tuple[int, int], set[int]] = {}
         accepted_improvements: list[float] = []
@@ -567,6 +775,7 @@ def defragment_stems_by_render_compare(
             )
             clamped_pitch = max(pitch_min, min(pitch_max, int(candidate.pitch)))
             pitch_row = clamped_pitch - pitch_min
+            rendered_split_time = _map_to_rendered_time(candidate.split_time_seconds)
             split_distance = _compute_boundary_envelope_distance_db(
                 target_pitch_db[pitch_row],
                 split_pitch_db[pitch_row],
@@ -574,6 +783,7 @@ def defragment_stems_by_render_compare(
                 frames_per_second=frames_per_second,
                 half_window_seconds=float(config.boundary_half_window_seconds),
                 flux_distance_weight=float(config.flux_distance_weight),
+                rendered_split_time_seconds=rendered_split_time,
             )
             merged_distance = _compute_boundary_envelope_distance_db(
                 target_pitch_db[pitch_row],
@@ -582,6 +792,7 @@ def defragment_stems_by_render_compare(
                 frames_per_second=frames_per_second,
                 half_window_seconds=float(config.boundary_half_window_seconds),
                 flux_distance_weight=float(config.flux_distance_weight),
+                rendered_split_time_seconds=rendered_split_time,
             )
             improvement_db = split_distance - merged_distance
             min_required = float(

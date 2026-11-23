@@ -6,6 +6,7 @@ import argparse
 import json
 from pathlib import Path
 
+from ..soundfont import RENDER_COMPARE_SPEED_PRESETS, resolve_soundfont_path
 from ..velocity.cli.infer_velocity import _resolve_stem_files, _resolve_stem_midi_directory
 from .render_compare_defragment import (
     RenderCompareDefragmentConfig,
@@ -39,8 +40,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--soundfont",
         type=Path,
-        required=True,
-        help="SoundFont (.sf2) used for FluidSynth Render & Compare timing verification",
+        default=None,
+        help="SoundFont (.sf2) used for FluidSynth Render & Compare. Downloads MuseScore_General.sf2 automatically when omitted.",
+    )
+    parser.add_argument(
+        "--speed",
+        choices=RENDER_COMPARE_SPEED_PRESETS,
+        default="balanced",
+        help="Render & Compare speed/quality preset (default: balanced)",
     )
     parser.add_argument(
         "--fluidsynth-executable",
@@ -148,6 +155,7 @@ def _resolve_beat_grid(args: argparse.Namespace) -> BeatGridInput:
 
 def main() -> None:
     args = parse_args()
+    resolved_soundfont = resolve_soundfont_path(args.soundfont)
     stem_midis = _resolve_stem_midi_directory(args.stem_midis_dir)
     stem_audios = _resolve_stem_files(args.stems_dir)
 
@@ -163,14 +171,21 @@ def main() -> None:
             if args.defragment_only
             else None
         )
+        base_defrag_config = RenderCompareDefragmentConfig.for_speed_preset(
+            resolved_soundfont,
+            speed=args.speed,
+            fluidsynth_executable=args.fluidsynth_executable,
+            max_melodic_instruments=int(args.max_midi_melodic_instruments),
+        )
         defrag_report = defragment_stems_by_render_compare(
             stem_midis=stem_midis,
             stem_audios=stem_audios,
             config=RenderCompareDefragmentConfig(
-                soundfont_path=args.soundfont,
-                fluidsynth_executable=args.fluidsynth_executable,
+                soundfont_path=base_defrag_config.soundfont_path,
+                fluidsynth_executable=base_defrag_config.fluidsynth_executable,
                 sustained_only=not args.defragment_include_plucked,
-                max_melodic_instruments=int(args.max_midi_melodic_instruments),
+                max_melodic_instruments=base_defrag_config.max_melodic_instruments,
+                render_active_windows_only=base_defrag_config.render_active_windows_only,
             ),
             output_midi_path=defrag_output_midi,
             output_stem_dir=defrag_stem_dir,
@@ -187,17 +202,25 @@ def main() -> None:
     beat_grid = _resolve_beat_grid(args)
 
     output_midi = args.output_midi or (args.stem_midis_dir / "merged_rc_quantized.mid")
+    base_quantize_config = RenderCompareQuantizeConfig.for_speed_preset(
+        resolved_soundfont,
+        speed=args.speed,
+        fluidsynth_executable=args.fluidsynth_executable,
+        max_melodic_instruments=int(args.max_midi_melodic_instruments),
+        write_tempo_map=not args.no_tempo_map,
+    )
     report = quantize_stems_by_render_compare(
         stem_midis=stem_midis,
         stem_audios=stem_audios,
         beat_grid=beat_grid,
         config=RenderCompareQuantizeConfig(
-            soundfont_path=args.soundfont,
-            fluidsynth_executable=args.fluidsynth_executable,
+            soundfont_path=base_quantize_config.soundfont_path,
+            fluidsynth_executable=base_quantize_config.fluidsynth_executable,
             align_beats_to_audio=not args.no_align_beats,
-            verify_full_mix=not args.no_verify_full_mix,
-            write_tempo_map=not args.no_tempo_map,
-            max_melodic_instruments=int(args.max_midi_melodic_instruments),
+            verify_full_mix=False if args.no_verify_full_mix else base_quantize_config.verify_full_mix,
+            write_tempo_map=base_quantize_config.write_tempo_map,
+            max_melodic_instruments=base_quantize_config.max_melodic_instruments,
+            adaptive_candidates=base_quantize_config.adaptive_candidates,
         ),
         original_mix_audio=args.original_mix_audio,
         output_midi_path=output_midi,

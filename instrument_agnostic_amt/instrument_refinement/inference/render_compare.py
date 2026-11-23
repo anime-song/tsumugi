@@ -5,27 +5,35 @@ Instrument Refinement モデルが出力した音色クラスタごとに、候�
 （ニューラル音色埋め込み + フレーム正規化スペクトル形状 + エンベロープ形状）が
 最も小さい GM プログラムを選定する。
 
-2 GB 級の SoundFont 読み込みコストを抑えるため、全クラスタ × 全スニペット × 全候補を
+大容量の SoundFont 読み込みコストを抑えるため、全クラスタ × 全スニペット × 全候補を
 1 本の結合 MIDI に時間軸パックし、FluidSynth を 1 ステムあたり 1 回だけ起動する。
 """
 
 from __future__ import annotations
 
 import math
-import shutil
-import subprocess
 import tempfile
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-import mido
 import numpy as np
 import soundfile as sf
 import torch
 
 from ...runtime import copy_tensors_to_cpu_once
+from ...soundfont import (
+    FluidSynthRenderOptions,
+    RENDER_COMPARE_SPEED_PRESETS,
+    default_parallel_render_workers,
+    render_midi_batch_to_stereo_arrays,
+    render_midi_to_stereo_array,
+    render_midi_with_fluidsynth,
+    resolve_fluidsynth_executable,
+    resolve_signal_processing_device,
+    write_packed_smf_type0,
+)
 from ...taxonomy.instrument_classes import (
     INSTRUMENT_CLASSES,
     get_gm_program_frequency,
@@ -73,6 +81,56 @@ class RenderCompareConfig:
     small_cluster_note_threshold: int = 40
     embedding_batch_size: int = 8
     top_report_programs: int = 5
+    parallel_render_workers: int | None = None
+
+    @classmethod
+    def for_speed_preset(
+        cls,
+        soundfont_path: Path | str,
+        *,
+        speed: str = "balanced",
+        fluidsynth_executable: Path | str | None = None,
+        parallel_render_workers: int | None = None,
+    ) -> "RenderCompareConfig":
+        """速度と精度のバランスプリセット (`fast` / `balanced` / `quality`) から設定を構築する。"""
+        normalized_speed = str(speed).strip().lower()
+        if normalized_speed not in RENDER_COMPARE_SPEED_PRESETS:
+            raise ValueError(f"speed must be one of {RENDER_COMPARE_SPEED_PRESETS}, got {speed!r}")
+        resolved_executable = Path(fluidsynth_executable) if fluidsynth_executable is not None else None
+        if normalized_speed == "fast":
+            return cls(
+                soundfont_path=Path(soundfont_path),
+                fluidsynth_executable=resolved_executable,
+                top_candidate_classes=3,
+                max_candidate_programs=10,
+                snippet_seconds=2.5,
+                max_snippets_per_cluster=1,
+                slot_gap_seconds=0.5,
+                disable_reverb=True,
+                disable_chorus=True,
+                embedding_batch_size=16,
+                parallel_render_workers=parallel_render_workers,
+            )
+        if normalized_speed == "balanced":
+            return cls(
+                soundfont_path=Path(soundfont_path),
+                fluidsynth_executable=resolved_executable,
+                top_candidate_classes=4,
+                max_candidate_programs=16,
+                snippet_seconds=3.0,
+                max_snippets_per_cluster=2,
+                slot_gap_seconds=0.6,
+                disable_reverb=True,
+                disable_chorus=True,
+                embedding_batch_size=16,
+                parallel_render_workers=parallel_render_workers,
+            )
+        return cls(
+            soundfont_path=Path(soundfont_path),
+            fluidsynth_executable=resolved_executable,
+            embedding_batch_size=16,
+            parallel_render_workers=parallel_render_workers,
+        )
 
     def __post_init__(self) -> None:
         if self.candidate_mode not in {"top_classes", "stem_all"}:
@@ -132,19 +190,6 @@ class _RenderSlot:
     channel: int
 
 
-def resolve_fluidsynth_executable(executable_path: str | Path | None) -> Path:
-    """FluidSynth 実行ファイルのパスを解決する。"""
-    if executable_path is not None:
-        candidate = Path(executable_path).expanduser().resolve()
-        if not candidate.is_file():
-            raise FileNotFoundError(f"FluidSynth executable not found: {candidate}")
-        return candidate
-    discovered = shutil.which("fluidsynth")
-    if discovered is None:
-        raise FileNotFoundError("FluidSynth was not found on PATH. Specify --fluidsynth-executable.")
-    return Path(discovered).resolve()
-
-
 def _render_packed_midi_with_fluidsynth(
     midi_path: Path,
     wav_path: Path,
@@ -153,27 +198,19 @@ def _render_packed_midi_with_fluidsynth(
     config: RenderCompareConfig,
 ) -> None:
     """パック済み MIDI を FluidSynth で一括レンダリングする（外部プロセス境界）。"""
-    soundfont_path = Path(config.soundfont_path).expanduser().resolve()
-    if not soundfont_path.is_file():
-        raise FileNotFoundError(f"SoundFont not found: {soundfont_path}")
-    executable = resolve_fluidsynth_executable(config.fluidsynth_executable)
-
-    command = [
-        str(executable),
-        "-ni",
-        "-g",
-        str(float(config.render_gain)),
-        "-r",
-        str(int(sample_rate)),
-        "-O",
-        "s16",
-    ]
-    if config.disable_reverb:
-        command.extend(["-R", "0"])
-    if config.disable_chorus:
-        command.extend(["-C", "0"])
-    command.extend(["-F", str(wav_path), str(soundfont_path), str(midi_path)])
-    subprocess.run(command, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+    render_midi_with_fluidsynth(
+        midi_path,
+        wav_path,
+        options=FluidSynthRenderOptions(
+            soundfont_path=Path(config.soundfont_path),
+            sample_rate=int(sample_rate),
+            fluidsynth_executable=config.fluidsynth_executable,
+            render_gain=float(config.render_gain),
+            disable_reverb=bool(config.disable_reverb),
+            disable_chorus=bool(config.disable_chorus),
+            polyphony=64,
+        ),
+    )
 
 
 def _collect_candidate_programs(
@@ -388,28 +425,19 @@ def _build_packed_candidate_midi(
     *,
     output_midi_path: Path,
     config: RenderCompareConfig,
+    minimum_candidates_per_cluster: int = 2,
 ) -> list[_RenderSlot]:
-    """全クラスタ × 全スニペット × 全候補を 1 本の MIDI へ時間軸パックして書き出す。
-
-    同一 tick に複数イベントが重なるときは program_change -> control_change -> note_off
-    -> note_on -> all_notes_off の優先順で並べる。
-    """
-    midi_file = mido.MidiFile(ticks_per_beat=_PACKED_TICKS_PER_BEAT)
-    track = mido.MidiTrack()
-    midi_file.tracks.append(track)
-
-    # (absolute_tick, priority, message) を集めて最後に一括ソートする。
-    scheduled_events: list[tuple[int, int, mido.Message | mido.MetaMessage]] = [
-        (0, 0, mido.MetaMessage("set_tempo", tempo=_PACKED_TEMPO_MICROSECONDS, time=0))
-    ]
+    """全クラスタ × 全スニペット × 全候補を 1 本の SMF Type-0 MIDI へ高速パックして書き出す。"""
+    scheduled_events: list[tuple[int, int, bytes]] = []
     slots: list[_RenderSlot] = []
     cursor_seconds = 0.0
     slot_counter = 0
+    velocity = max(1, min(127, int(config.render_velocity)))
 
     for cluster_id in sorted(snippets_by_cluster):
         snippets = snippets_by_cluster[cluster_id]
         candidates = candidates_by_cluster.get(cluster_id, [])
-        if not snippets or len(candidates) <= 1:
+        if not snippets or len(candidates) < int(minimum_candidates_per_cluster):
             continue
         for snippet in snippets:
             for candidate in candidates:
@@ -421,19 +449,14 @@ def _build_packed_candidate_midi(
                 end_tick = int(round(slot_end * _PACKED_TICKS_PER_SECOND))
 
                 # スロット先頭で音色・音量・ペダルを初期化する。
-                scheduled_events.append(
-                    (start_tick, 1, mido.Message("program_change", channel=channel, program=candidate.program_number, time=0))
-                )
-                scheduled_events.append(
-                    (start_tick, 2, mido.Message("control_change", channel=channel, control=7, value=127, time=0))
-                )
-                scheduled_events.append(
-                    (start_tick, 2, mido.Message("control_change", channel=channel, control=11, value=127, time=0))
-                )
-                scheduled_events.append(
-                    (start_tick, 2, mido.Message("control_change", channel=channel, control=64, value=0, time=0))
-                )
+                cc_status = 0xB0 | channel
+                scheduled_events.append((start_tick, 1, bytes((0xC0 | channel, max(0, min(127, int(candidate.program_number)))))))
+                scheduled_events.append((start_tick, 2, bytes((cc_status, 7, 127))))
+                scheduled_events.append((start_tick, 2, bytes((cc_status, 11, 127))))
+                scheduled_events.append((start_tick, 2, bytes((cc_status, 64, 0))))
 
+                note_on_status = 0x90 | channel
+                note_off_status = 0x80 | channel
                 for note_start, note_end, pitch in zip(
                     snippet.relative_start_seconds.tolist(),
                     snippet.relative_end_seconds.tolist(),
@@ -445,35 +468,13 @@ def _build_packed_candidate_midi(
                         min(end_tick, int(round((slot_start + float(note_end)) * _PACKED_TICKS_PER_SECOND))),
                     )
                     clamped_pitch = max(0, min(127, int(pitch)))
-                    scheduled_events.append(
-                        (
-                            note_on_tick,
-                            4,
-                            mido.Message(
-                                "note_on",
-                                channel=channel,
-                                note=clamped_pitch,
-                                velocity=int(config.render_velocity),
-                                time=0,
-                            ),
-                        )
-                    )
-                    scheduled_events.append(
-                        (
-                            note_off_tick,
-                            3,
-                            mido.Message("note_off", channel=channel, note=clamped_pitch, velocity=0, time=0),
-                        )
-                    )
+                    scheduled_events.append((note_on_tick, 4, bytes((note_on_status, clamped_pitch, velocity))))
+                    scheduled_events.append((note_off_tick, 3, bytes((note_off_status, clamped_pitch, 0))))
 
                 # スロット終了直後に全発音を停止し、次スロットへの残響混入を抑える。
                 cleanup_tick = end_tick + int(round(min(0.05, config.slot_gap_seconds * 0.25) * _PACKED_TICKS_PER_SECOND))
-                scheduled_events.append(
-                    (cleanup_tick, 5, mido.Message("control_change", channel=channel, control=123, value=0, time=0))
-                )
-                scheduled_events.append(
-                    (cleanup_tick, 6, mido.Message("control_change", channel=channel, control=120, value=0, time=0))
-                )
+                scheduled_events.append((cleanup_tick, 5, bytes((cc_status, 123, 0))))
+                scheduled_events.append((cleanup_tick, 6, bytes((cc_status, 120, 0))))
 
                 slots.append(
                     _RenderSlot(
@@ -487,19 +488,12 @@ def _build_packed_candidate_midi(
                 )
                 cursor_seconds = slot_end + float(config.slot_gap_seconds)
 
-    # 末尾スロットの終端が FluidSynth によって切り詰められないよう余白を確保する。
-    final_tick = int(round((cursor_seconds + 0.2) * _PACKED_TICKS_PER_SECOND))
-    scheduled_events.append((final_tick, 7, mido.MetaMessage("end_of_track", time=0)))
-    scheduled_events.sort(key=lambda item: (item[0], item[1]))
-
-    previous_tick = 0
-    for absolute_tick, _priority, message in scheduled_events:
-        delta_ticks = max(0, absolute_tick - previous_tick)
-        track.append(message.copy(time=delta_ticks))
-        previous_tick = absolute_tick
-
-    output_midi_path.parent.mkdir(parents=True, exist_ok=True)
-    midi_file.save(str(output_midi_path))
+    write_packed_smf_type0(
+        output_midi_path,
+        scheduled_events,
+        ticks_per_beat=_PACKED_TICKS_PER_BEAT,
+        tempo_microseconds=_PACKED_TEMPO_MICROSECONDS,
+    )
     return slots
 
 
@@ -703,10 +697,26 @@ def _compute_rendered_slot_embeddings(
 
     context_id = stem_context_id(inference_stem_group(stem_name))
     embeddings_by_slot: dict[tuple[int, int, int], np.ndarray] = {}
+    # 並列レンダリング由来のチャンク順のままバッチ化すると、長短・疎密の異なるスニペットが混ざって
+    # パディング比率が増大し GPU 計算量が増える。波形長とノート数で並べて同一スニペットの候補群を
+    # 同一バッチに集めることで、パディングの無駄を最小化する。
+    ordered_pairs = sorted(
+        zip(slots, slot_waveforms),
+        key=lambda pair: (
+            int(pair[1].shape[1]),
+            int(snippets_by_key[(pair[0].cluster_id, pair[0].snippet_index)].pitches.size),
+        ),
+    )
+    ordered_slots = [pair[0] for pair in ordered_pairs]
+    ordered_waveforms = [pair[1] for pair in ordered_pairs]
 
-    for batch_offset in range(0, len(slots), int(batch_size)):
-        batch_slots = slots[batch_offset : batch_offset + int(batch_size)]
-        batch_waveforms = slot_waveforms[batch_offset : batch_offset + int(batch_size)]
+    # バッチごとに GPU 上で正規化重心ベクトル [B, D] を計算して溜め、全バッチ終了後に 1 回だけ CPU へ転送する。
+    collected_slots: list[_RenderSlot] = []
+    collected_centroids_on_device: list[torch.Tensor] = []
+
+    for batch_offset in range(0, len(ordered_slots), int(batch_size)):
+        batch_slots = ordered_slots[batch_offset : batch_offset + int(batch_size)]
+        batch_waveforms = ordered_waveforms[batch_offset : batch_offset + int(batch_size)]
 
         # RecursiveCQT の最下段オクターブ STFT で reflect padding が入力長を超えないよう、
         # 短いスニペットでも最低 2.0 秒分まで 0 埋めし、実長は valid_audio_frames で伝える。
@@ -740,6 +750,7 @@ def _compute_rendered_slot_embeddings(
         for index, count in enumerate(note_counts):
             note_mask[index, :count] = True
 
+        note_mask_device = note_mask.to(device)
         window_seconds = float(max_samples) / float(model_config.sample_rate)
         with torch.amp.autocast(
             device_type=device.type,
@@ -759,19 +770,24 @@ def _compute_rendered_slot_embeddings(
                     device=device,
                 ),
                 note_confidence=torch.ones((len(batch_slots), max_notes), device=device),
-                note_mask=note_mask.to(device),
+                note_mask=note_mask_device,
                 stem_context_id=torch.full((len(batch_slots),), context_id, dtype=torch.long, device=device),
                 window_seconds=window_seconds,
             )
-        (note_embeddings_tensor,) = copy_tensors_to_cpu_once((outputs["note_embedding"].float(),))
+        note_embeddings_dev = outputs["note_embedding"].float()
+        mask_weights = note_mask_device.unsqueeze(-1).to(dtype=note_embeddings_dev.dtype)
+        denom = mask_weights.sum(dim=1).clamp_min(1.0)
+        centroids = (note_embeddings_dev * mask_weights).sum(dim=1) / denom
+        norms = torch.linalg.vector_norm(centroids, dim=-1, keepdim=True)
+        centroids = torch.where(norms > 1e-8, centroids / norms.clamp_min(1e-8), centroids)
+        collected_centroids_on_device.append(centroids.detach())
+        collected_slots.extend(batch_slots)
         del outputs
-        note_embeddings_numpy = note_embeddings_tensor.numpy()
 
-        for index, (slot, count) in enumerate(zip(batch_slots, note_counts)):
-            centroid = note_embeddings_numpy[index, :count].mean(axis=0).astype(np.float64)
-            norm = float(np.linalg.norm(centroid))
-            if norm > 1e-8:
-                centroid /= norm
+    if collected_centroids_on_device:
+        (all_centroids_cpu,) = copy_tensors_to_cpu_once((torch.cat(collected_centroids_on_device, dim=0),))
+        all_centroids_numpy = all_centroids_cpu.numpy().astype(np.float64, copy=False)
+        for slot, centroid in zip(collected_slots, all_centroids_numpy):
             embeddings_by_slot[(slot.cluster_id, slot.snippet_index, slot.program_number)] = centroid
 
     return embeddings_by_slot
@@ -837,47 +853,20 @@ def select_gm_programs_by_render_compare(
         for snippet in snippets:
             snippets_by_key[(cluster_id, snippet.snippet_index)] = snippet
 
-    # 2. 全候補を 1 本の MIDI にパックし、FluidSynth を 1 回だけ起動して一括レンダリングする。
+    # 2. 全候補を FluidSynth でレンダリングする。
+    #    本番 FluidSynth 実行かつスロット数が多い場合はワーカー数分の小パック MIDI に分割して並列実行する。
     rendered_audio_by_slot: dict[tuple[int, int, int], np.ndarray] = {}
     rendered_slots: list[_RenderSlot] = []
     if any(snippets_by_cluster.values()):
         with tempfile.TemporaryDirectory(prefix="tsumugi_render_compare_") as temp_directory:
             temp_root = Path(temp_directory)
-            packed_midi_path = temp_root / "candidates_packed.mid"
-            packed_wav_path = temp_root / "candidates_packed.wav"
-            rendered_slots = _build_packed_candidate_midi(
-                snippets_by_cluster,
-                candidates_by_cluster,
-                output_midi_path=packed_midi_path,
-                config=render_compare_config,
-            )
-            if rendered_slots:
-                if packed_midi_renderer is not None:
-                    packed_midi_renderer(packed_midi_path, packed_wav_path, sample_rate)
-                else:
-                    _render_packed_midi_with_fluidsynth(
-                        packed_midi_path,
-                        packed_wav_path,
-                        sample_rate,
-                        config=render_compare_config,
-                    )
-                rendered_full, rendered_sample_rate = sf.read(
-                    str(packed_wav_path),
-                    dtype="float32",
-                    always_2d=True,
-                )
-                if int(rendered_sample_rate) != sample_rate:
-                    raise ValueError(
-                        f"Rendered sample rate mismatch: expected {sample_rate}, got {rendered_sample_rate}"
-                    )
-                # [T, C] -> [2, T] ステレオへ整形する。
-                if rendered_full.shape[1] == 1:
-                    rendered_stereo = np.repeat(rendered_full.T, 2, axis=0)
-                else:
-                    rendered_stereo = rendered_full[:, :2].T
 
+            def _slice_rendered_stereo_into_slots(
+                rendered_stereo: np.ndarray,
+                batch_slots: list[_RenderSlot],
+            ) -> None:
                 total_rendered_samples = int(rendered_stereo.shape[1])
-                for slot in rendered_slots:
+                for slot in batch_slots:
                     snippet = snippets_by_key[(slot.cluster_id, slot.snippet_index)]
                     expected_samples = int(snippet.target_audio.shape[1])
                     start_sample = max(0, int(round(slot.slot_start_seconds * sample_rate)))
@@ -888,6 +877,110 @@ def select_gm_programs_by_render_compare(
                         np.float32,
                         copy=True,
                     )
+
+            render_options = FluidSynthRenderOptions(
+                soundfont_path=Path(render_compare_config.soundfont_path),
+                sample_rate=int(sample_rate),
+                fluidsynth_executable=render_compare_config.fluidsynth_executable,
+                render_gain=float(render_compare_config.render_gain),
+                disable_reverb=bool(render_compare_config.disable_reverb),
+                disable_chorus=bool(render_compare_config.disable_chorus),
+                polyphony=64,
+            )
+
+            total_candidate_slots = sum(
+                len(snippets_by_cluster[cid]) * len(candidates_by_cluster.get(cid, []))
+                for cid in snippets_by_cluster
+                if len(candidates_by_cluster.get(cid, [])) > 1
+            )
+            parallel_workers = (
+                default_parallel_render_workers(
+                    Path(render_compare_config.soundfont_path),
+                    max(1, total_candidate_slots // 6),
+                    max_workers=render_compare_config.parallel_render_workers,
+                )
+                if packed_midi_renderer is None and total_candidate_slots >= 12
+                else 1
+            )
+
+            if parallel_workers <= 1:
+                packed_midi_path = temp_root / "candidates_packed.mid"
+                rendered_slots = _build_packed_candidate_midi(
+                    snippets_by_cluster,
+                    candidates_by_cluster,
+                    output_midi_path=packed_midi_path,
+                    config=render_compare_config,
+                )
+                if rendered_slots:
+                    if packed_midi_renderer is not None:
+                        packed_wav_path = temp_root / "candidates_packed.wav"
+                        packed_midi_renderer(packed_midi_path, packed_wav_path, sample_rate)
+                        rendered_full, rendered_sample_rate = sf.read(
+                            str(packed_wav_path),
+                            dtype="float32",
+                            always_2d=True,
+                        )
+                        if int(rendered_sample_rate) != sample_rate:
+                            raise ValueError(
+                                f"Rendered sample rate mismatch: expected {sample_rate}, got {rendered_sample_rate}"
+                            )
+                        rendered_stereo = (
+                            np.repeat(rendered_full.T, 2, axis=0)
+                            if rendered_full.shape[1] == 1
+                            else rendered_full[:, :2].T
+                        )
+                    else:
+                        rendered_stereo = render_midi_to_stereo_array(
+                            packed_midi_path,
+                            options=render_options,
+                        )
+                    _slice_rendered_stereo_into_slots(rendered_stereo, rendered_slots)
+            else:
+                # 候補をワーカー数へ均等にラウンドロビン分割し、常駐 FluidSynth プールで並列合成する。
+                chunk_candidates: list[dict[int, list[_CandidateProgram]]] = [
+                    {} for _ in range(parallel_workers)
+                ]
+                chunk_snippets: list[dict[int, list[_ClusterSnippet]]] = [
+                    {} for _ in range(parallel_workers)
+                ]
+                round_robin_index = 0
+                for cluster_id in sorted(snippets_by_cluster):
+                    snippets = snippets_by_cluster[cluster_id]
+                    candidates = candidates_by_cluster.get(cluster_id, [])
+                    if not snippets or len(candidates) <= 1:
+                        continue
+                    for candidate in candidates:
+                        bucket_index = round_robin_index % parallel_workers
+                        chunk_candidates[bucket_index].setdefault(cluster_id, []).append(candidate)
+                        chunk_snippets[bucket_index][cluster_id] = snippets
+                        round_robin_index += 1
+
+                chunk_midi_paths: list[Path] = []
+                batch_slot_lists: list[list[_RenderSlot]] = []
+                for chunk_index in range(parallel_workers):
+                    if not chunk_candidates[chunk_index]:
+                        continue
+                    # 1 候補だけになったクラスタも除外されないよう、候補数チェックを一時バイパスして書き出す。
+                    chunk_midi_path = temp_root / f"candidates_chunk_{chunk_index}.mid"
+                    chunk_slots = _build_packed_candidate_midi(
+                        chunk_snippets[chunk_index],
+                        chunk_candidates[chunk_index],
+                        output_midi_path=chunk_midi_path,
+                        config=render_compare_config,
+                        minimum_candidates_per_cluster=1,
+                    )
+                    if chunk_slots:
+                        chunk_midi_paths.append(chunk_midi_path)
+                        batch_slot_lists.append(chunk_slots)
+                        rendered_slots.extend(chunk_slots)
+
+                rendered_chunk_waveforms = render_midi_batch_to_stereo_arrays(
+                    chunk_midi_paths,
+                    options=render_options,
+                    max_workers=parallel_workers,
+                )
+                for chunk_stereo, chunk_slots in zip(rendered_chunk_waveforms, batch_slot_lists):
+                    _slice_rendered_stereo_into_slots(chunk_stereo, chunk_slots)
 
     # 3. レンダリング済み候補のニューラル音色埋め込みをバッチ計算する（重み > 0 のとき）。
     rendered_embeddings: dict[tuple[int, int, int], np.ndarray] = {}
@@ -909,7 +1002,7 @@ def select_gm_programs_by_render_compare(
             batch_size=render_compare_config.embedding_batch_size,
         )
 
-    # 4. 元ステム側の対数メル特徴をスニペットごとに 1 回だけ事前計算する。
+    # 4. 元ステム側およびレンダリング候補側の対数メル特徴を GPU 上で同一長バッチ STFT により一括計算する。
     max_frequency_hz = min(8000.0, float(sample_rate) * 0.45)
     min_frequency_hz = min(40.0, max_frequency_hz * 0.25)
     n_fft = min(1024, max(32, 2 ** int(math.floor(math.log2(max(32.0, float(sample_rate) * 0.05))))))
@@ -923,15 +1016,49 @@ def select_gm_programs_by_render_compare(
         max_frequency_hz=max_frequency_hz,
     )
 
+    signal_device = resolve_signal_processing_device()
+    hann_window_tensor = torch.hann_window(n_fft, dtype=torch.float32, device=signal_device)
+    mel_filterbank_tensor = torch.from_numpy(mel_filterbank).to(device=signal_device, dtype=torch.float32)
+
+    # 同一スニペットに属する全候補は同一サンプル長を持つため、サンプル長ごとにまとめてバッチ STFT する。
+    # 末尾ゼロ埋めによる反射境界の変化を起こさず、単発 STFT と数値同一のまま GPU 並列化できる。
+    grouped_mono_waveforms: dict[int, list[tuple[tuple[Any, ...], np.ndarray]]] = {}
+    for key, snippet in snippets_by_key.items():
+        mono = snippet.target_audio.mean(axis=0).astype(np.float32, copy=False)
+        if mono.size < n_fft:
+            mono = np.pad(mono, (0, n_fft - mono.size))
+        grouped_mono_waveforms.setdefault(int(mono.size), []).append((("target", key), mono))
+    for slot_key, rendered_audio in rendered_audio_by_slot.items():
+        mono = rendered_audio.mean(axis=0).astype(np.float32, copy=False)
+        if mono.size < n_fft:
+            mono = np.pad(mono, (0, n_fft - mono.size))
+        grouped_mono_waveforms.setdefault(int(mono.size), []).append((("rendered", slot_key), mono))
+
+    batched_features_by_tag: dict[tuple[Any, ...], tuple[np.ndarray, np.ndarray]] = {}
+    with torch.inference_mode():
+        for group_items in grouped_mono_waveforms.values():
+            batch_array = np.stack([item[1] for item in group_items], axis=0)
+            batch_tensor = torch.from_numpy(batch_array).to(device=signal_device, dtype=torch.float32)
+            spectrum = torch.stft(
+                batch_tensor,
+                n_fft=n_fft,
+                hop_length=hop_length,
+                win_length=n_fft,
+                window=hann_window_tensor,
+                center=True,
+                return_complex=True,
+            )
+            # power: [B, freq_bins, num_frames] -> mel_power: [B, num_mels, num_frames]
+            power = spectrum.real.square() + spectrum.imag.square()
+            mel_power = torch.einsum("mf,bft->bmt", mel_filterbank_tensor, power)
+            log_mel_batch = (10.0 * torch.log10(mel_power.clamp_min(1e-10))).cpu().numpy().astype(np.float32)
+            frame_db_batch = (10.0 * torch.log10(power.mean(dim=1).clamp_min(1e-10))).cpu().numpy().astype(np.float32)
+            for item_index, (tag, _mono) in enumerate(group_items):
+                batched_features_by_tag[tag] = (log_mel_batch[item_index], frame_db_batch[item_index])
+
     target_features_by_key: dict[tuple[int, int], tuple[np.ndarray, np.ndarray, np.ndarray]] = {}
     for key, snippet in snippets_by_key.items():
-        target_log_mel, target_frame_db = _compute_log_mel_and_frame_db(
-            snippet.target_audio,
-            sample_rate=sample_rate,
-            n_fft=n_fft,
-            hop_length=hop_length,
-            mel_filterbank=mel_filterbank,
-        )
+        target_log_mel, target_frame_db = batched_features_by_tag[("target", key)]
         target_centroid = note_embeddings[snippet.note_indices].mean(axis=0).astype(np.float64)
         norm = float(np.linalg.norm(target_centroid))
         if norm > 1e-8:
@@ -997,13 +1124,7 @@ def select_gm_programs_by_render_compare(
                 target_log_mel, target_frame_db, target_centroid = target_features_by_key[
                     (cluster_id, snippet.snippet_index)
                 ]
-                rendered_log_mel, rendered_frame_db = _compute_log_mel_and_frame_db(
-                    rendered_audio,
-                    sample_rate=sample_rate,
-                    n_fft=n_fft,
-                    hop_length=hop_length,
-                    mel_filterbank=mel_filterbank,
-                )
+                rendered_log_mel, rendered_frame_db = batched_features_by_tag[("rendered", slot_key)]
                 spectral_distance, envelope_distance = _compute_spectral_and_envelope_distances(
                     target_log_mel,
                     target_frame_db,

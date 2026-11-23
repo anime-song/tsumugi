@@ -169,6 +169,12 @@ def _scan_windows(
     start_batches = [
         starts[offset : offset + int(window_batch_size)] for offset in range(0, len(starts), int(window_batch_size))
     ]
+    # 各バッチの推論出力をデバイス上に保持し、全バッチ完了後にまとめて CPU へ転送することで
+    # 毎バッチの CUDA 同期ストールを解消する（各出力は軽量なロジット・埋め込みのみ）。
+    pending_batch_outputs: list[
+        tuple[list[int], list[np.ndarray], torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]
+    ] = []
+
     for batch_starts in tqdm(
         start_batches,
         desc="refine instruments",
@@ -261,6 +267,26 @@ def _scan_windows(
                 ),
                 window_seconds=window_seconds,
             )
+        pending_batch_outputs.append(
+            (
+                batch_starts,
+                indices_batch,
+                outputs["window_logits"].float().detach(),
+                outputs["window_embedding"].float().detach(),
+                outputs["note_logits"].float().detach(),
+                outputs["note_embedding"].float().detach(),
+            )
+        )
+        del outputs
+
+    for (
+        batch_starts,
+        indices_batch,
+        window_logits_dev,
+        window_embeddings_dev,
+        note_logits_dev,
+        note_embeddings_dev,
+    ) in pending_batch_outputs:
         (
             window_logits_tensor,
             window_embeddings_tensor,
@@ -268,13 +294,12 @@ def _scan_windows(
             note_embeddings_tensor,
         ) = copy_tensors_to_cpu_once(
             (
-                outputs["window_logits"].float(),
-                outputs["window_embedding"].float(),
-                outputs["note_logits"].float(),
-                outputs["note_embedding"].float(),
+                window_logits_dev,
+                window_embeddings_dev,
+                note_logits_dev,
+                note_embeddings_dev,
             )
         )
-        del outputs
         window_logits_batch = window_logits_tensor.numpy()
         window_embeddings_batch = window_embeddings_tensor.numpy()
         note_logits_batch = note_logits_tensor.numpy()
